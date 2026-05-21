@@ -16,6 +16,7 @@ export interface AgentOptions {
   provider: ProviderName;
   systemPrompt: string;
   maxTurns: number;
+  budgetUsd?: number;
   sessionId: string;
   onText?: (text: string) => void;
   onToolStart?: (call: ToolCall) => void | Promise<void>;
@@ -96,6 +97,19 @@ export async function runAgentLoop(
           ? calculateOpenRouterCost(opts.model, totalInputTokens, totalOutputTokens)
           : calculateCost(opts.model, totalInputTokens, totalOutputTokens);
         opts.onCostUpdate?.(cost, { input: totalInputTokens, output: totalOutputTokens });
+
+        // Enforce budget limit
+        if (opts.budgetUsd && cost > opts.budgetUsd) {
+          finalSummary = `Session stopped: budget limit of $${opts.budgetUsd.toFixed(2)} exceeded ($${cost.toFixed(4)} spent after ${turns} turn(s)).`;
+          return {
+            success: false,
+            summary: finalSummary,
+            turns,
+            totalCost: cost,
+            totalTokens: { input: totalInputTokens, output: totalOutputTokens },
+          };
+        }
+
         break; // stream completed successfully
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
@@ -125,20 +139,18 @@ export async function runAgentLoop(
 
     messages.push({ role: 'assistant', content: assistantContent });
 
-    // Handle final_answer or no tool calls
+    // If the agent produced no tool calls, it's done
+    if (pendingToolCalls.length === 0) break;
+
+    // Separate final_answer from actionable tools so we execute everything
+    // before exiting — a single turn may include both writes and final_answer
     const finalAnswerCall = pendingToolCalls.find((tc) => tc.name === 'final_answer');
-    if (finalAnswerCall || pendingToolCalls.length === 0) {
-      if (finalAnswerCall) {
-        finalSummary = (finalAnswerCall.input.summary as string) || 'Task completed.';
-        finalAnswerFound = true;
-      }
-      break;
-    }
+    const actionableCalls = pendingToolCalls.filter((tc) => tc.name !== 'final_answer');
 
     // Execute tool calls
     const toolResults: Array<{ type: 'tool_result'; tool_use_id: string; content: string }> = [];
 
-    for (const tc of pendingToolCalls) {
+    for (const tc of actionableCalls) {
       const call: ToolCall = { name: tc.name, input: tc.input };
       const risk = classifyRisk(call);
 
@@ -185,7 +197,16 @@ export async function runAgentLoop(
       });
     }
 
-    messages.push({ role: 'user', content: toolResults as unknown as ChatMessage['content'] });
+    if (toolResults.length > 0) {
+      messages.push({ role: 'user', content: toolResults as unknown as ChatMessage['content'] });
+    }
+
+    // Now handle final_answer — all other tools have been executed
+    if (finalAnswerCall) {
+      finalSummary = (finalAnswerCall.input.summary as string) || 'Task completed.';
+      finalAnswerFound = true;
+      break;
+    }
   }
 
   const totalCost = isOpenRouter

@@ -284,8 +284,10 @@ export function printSlashHelp(): void {
         ['/yolo',            'shortcut for /mode yolo'],
         ['/safe',            'shortcut for /mode review'],
         ['/lock',            'shortcut for /mode lockdown'],
+        ['/budget [usd]',    'show or set spend budget (e.g. /budget 1.00)'],
         ['/models',          'list available models'],
         ['/sessions',        'list past session log files'],
+        ['/version',         'show TRIDENT CLI version'],
       ],
     },
   ];

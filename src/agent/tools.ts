@@ -1,6 +1,6 @@
-import { readFile, writeFile, unlink, readdir, lstat } from 'fs/promises';
+import { readFile, writeFile, mkdir, unlink, readdir, lstat } from 'fs/promises';
 import { existsSync } from 'fs';
-import { join, resolve, relative } from 'path';
+import { resolve, relative, dirname } from 'path';
 import { execa } from 'execa';
 import fg from 'fast-glob';
 
@@ -56,9 +56,7 @@ export async function executeTool(
       case 'write_file': {
         const { path: filePath, content } = call.input as { path: string; content: string };
         const absPath = resolve(cwd, filePath);
-        const { mkdirSync } = await import('fs');
-        const { dirname } = await import('path');
-        mkdirSync(dirname(absPath), { recursive: true });
+        await mkdir(dirname(absPath), { recursive: true });
         await writeFile(absPath, content as string, 'utf-8');
         return { success: true, output: `Written: ${relative(cwd, absPath)}`, duration_ms: Date.now() - start };
       }
@@ -74,7 +72,8 @@ export async function executeTool(
         for (const edit of edits) {
           const idx = content.indexOf(edit.old_str);
           if (idx === -1) {
-            return { success: false, output: '', error: `String not found in file: "${edit.old_str.slice(0, 50)}..."`, duration_ms: Date.now() - start };
+            const preview = edit.old_str.length > 50 ? `${edit.old_str.slice(0, 50)}...` : edit.old_str;
+          return { success: false, output: '', error: `String not found in file: "${preview}"`, duration_ms: Date.now() - start };
           }
           const occurrences = content.split(edit.old_str).length - 1;
           if (occurrences > 1) {

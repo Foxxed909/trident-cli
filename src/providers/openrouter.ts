@@ -242,7 +242,6 @@ export async function* streamOpenRouter(
         // Malformed tool args
       }
     }
-    yield { type: 'text', text: '\n[OpenRouter stream ended unexpectedly without [DONE]]' };
     yield { type: 'done' };
   }
 }

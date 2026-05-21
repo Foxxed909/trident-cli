@@ -391,8 +391,10 @@ async function showCommandPicker(
         { cmd: '/yolo',     desc: 'mode → YOLO (approve all)' },
         { cmd: '/safe',     desc: 'mode → REVIEW (confirm writes)' },
         { cmd: '/lock',     desc: 'mode → LOCKDOWN (confirm everything)' },
+        { cmd: '/budget',   desc: 'show or set spend budget' },
         { cmd: '/models',   desc: 'list available models' },
         { cmd: '/sessions', desc: 'list past session log files' },
+        { cmd: '/version',  desc: 'show TRIDENT CLI version' },
       ],
     },
   ];
@@ -480,9 +482,11 @@ async function runTrident(
     return answer;
   };
 
+  const budgetUsd = cliOpts?.budget ? parseFloat(cliOpts.budget) : config.budgetUsd;
+
   // ONE-SHOT MODE
   if (initialTask) {
-    await executeTask(initialTask, { model, mode, provider, maxTurns, systemPrompt, cwd, askUserFn });
+    await executeTask(initialTask, { model, mode, provider, maxTurns, budgetUsd, systemPrompt, cwd, askUserFn });
     return;
   }
 
@@ -496,6 +500,7 @@ async function runTrident(
     cost: 0,
     tokens: { input: 0, output: 0 },
     turns: 0,
+    budget: budgetUsd,
   };
 
   // Undo stack — persists across tasks in the session
@@ -562,7 +567,7 @@ async function runTrident(
         printInfo(`Retrying: ${lastTask}`);
         const result = await executeTask(lastTask, {
           model: session.model, mode: session.mode, provider: session.provider,
-          maxTurns, systemPrompt, cwd, askUserFn,
+          maxTurns, budgetUsd: session.budget, systemPrompt, cwd, askUserFn,
           undoStack,
         });
         if (result) {
@@ -703,6 +708,30 @@ async function runTrident(
         return true;
       }
 
+      case 'budget': {
+        if (!arg) {
+          if (session.budget != null && session.budget > 0) {
+            const remaining = Math.max(0, session.budget - session.cost);
+            printInfo(`Budget: $${session.budget.toFixed(2)}  |  spent: $${session.cost.toFixed(4)}  |  remaining: $${remaining.toFixed(4)}`);
+          } else {
+            printInfo('No budget set. Use /budget <usd> to set one (e.g. /budget 1.00).');
+          }
+        } else {
+          const b = parseFloat(arg);
+          if (isNaN(b) || b <= 0) {
+            printError('Usage: /budget <usd>  (e.g. /budget 1.00)');
+          } else {
+            session.budget = b;
+            printSuccess(`Budget → $${b.toFixed(2)}`);
+          }
+        }
+        return true;
+      }
+
+      case 'version': case 'v':
+        printInfo(`TRIDENT CLI v1.0.0`);
+        return true;
+
       case 'models':
         await program.commands.find(c => c.name() === 'models')?.parseAsync([], { from: 'user' });
         return true;
@@ -758,6 +787,7 @@ async function runTrident(
         mode: session.mode,
         provider: session.provider,
         maxTurns,
+        budgetUsd: session.budget,
         systemPrompt,
         cwd,
         askUserFn,
@@ -791,6 +821,7 @@ async function executeTask(
     provider: ProviderName;
     mode: 'yolo' | 'review' | 'lockdown';
     maxTurns: number;
+    budgetUsd?: number;
     systemPrompt: string;
     cwd: string;
     askUserFn: (q: string) => Promise<string>;
@@ -824,6 +855,7 @@ async function executeTask(
       provider: opts.provider,
       systemPrompt: opts.systemPrompt,
       maxTurns: opts.maxTurns,
+      budgetUsd: opts.budgetUsd,
       sessionId,
       onText: printAgentText,
       onToolStart,
