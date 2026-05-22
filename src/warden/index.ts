@@ -23,7 +23,9 @@ export interface ActionLog {
 export function classifyRisk(call: ToolCall): RiskLevel {
   switch (call.name) {
     case 'read_file':
+    case 'read_file_range':
     case 'list_dir':
+    case 'glob_files':
     case 'search_codebase':
     case 'web_fetch':
     case 'ask_user':
@@ -32,6 +34,8 @@ export function classifyRisk(call: ToolCall): RiskLevel {
 
     case 'write_file':
     case 'edit_file':
+    case 'create_dir':
+    case 'move_file':
       return 'write';
 
     case 'run_command': {
@@ -126,8 +130,15 @@ function formatInputPreview(call: ToolCall): string {
     case 'write_file':
     case 'edit_file':
     case 'delete_file':
+    case 'create_dir':
     case 'read_file':
       return `  📄 ${chalk.cyan(call.input.path as string)}`;
+    case 'read_file_range':
+      return `  📄 ${chalk.cyan(call.input.path as string)} lines ${call.input.start_line}–${call.input.end_line}`;
+    case 'glob_files':
+      return `  🔍 ${chalk.cyan(call.input.pattern as string)}`;
+    case 'move_file':
+      return `  📄 ${chalk.cyan(call.input.src as string)} → ${chalk.cyan(call.input.dest as string)}`;
     default:
       return '';
   }

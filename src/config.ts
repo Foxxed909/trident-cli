@@ -15,6 +15,10 @@ export const ConfigSchema = z.object({
   logSessions: z.boolean().default(true),
   onboarded: z.boolean().default(false),
   userName: z.string().default(''),
+  commandTimeout: z.number().default(30_000),
+  searchMaxFiles: z.number().default(100),
+  parallelTools: z.number().default(3),
+  disabledTools: z.array(z.string()).default([]),
 });
 
 export type TridentConfig = z.infer<typeof ConfigSchema>;
@@ -33,6 +37,10 @@ const store = new Conf<TridentConfig>({
     logSessions: { type: 'boolean', default: true },
     onboarded: { type: 'boolean', default: false },
     userName: { type: 'string', default: '' },
+    commandTimeout: { type: 'number', default: 30_000 },
+    searchMaxFiles: { type: 'number', default: 100 },
+    parallelTools: { type: 'number', default: 3 },
+    disabledTools: { type: 'array', items: { type: 'string' }, default: [] },
   },
 });
 
@@ -51,6 +59,10 @@ export function getConfig(): TridentConfig {
     logSessions: (store.get('logSessions') as boolean) ?? true,
     onboarded: (store.get('onboarded') as boolean) ?? false,
     userName: (store.get('userName') as string) || '',
+    commandTimeout: (store.get('commandTimeout') as number) || 30_000,
+    searchMaxFiles: (store.get('searchMaxFiles') as number) || 100,
+    parallelTools: (store.get('parallelTools') as number) || 3,
+    disabledTools: (store.get('disabledTools') as string[]) || [],
   };
 }
 

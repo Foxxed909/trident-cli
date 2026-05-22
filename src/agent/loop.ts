@@ -1,4 +1,6 @@
 import chalk from 'chalk';
+import ora from 'ora';
+import PQueue from 'p-queue';
 import { createDiffView } from '../ui/diff.js';
 import { streamCompletion, calculateCost } from '../providers/anthropic.js';
 import { streamOpenRouter, calculateOpenRouterCost } from '../providers/openrouter.js';
@@ -18,6 +20,11 @@ export interface AgentOptions {
   maxTurns: number;
   budgetUsd?: number;
   sessionId: string;
+  logSessions?: boolean;
+  commandTimeout?: number;
+  searchMaxFiles?: number;
+  parallelTools?: number;
+  disabledTools?: string[];
   onText?: (text: string) => void;
   onToolStart?: (call: ToolCall) => void | Promise<void>;
   onToolEnd?: (call: ToolCall, result: ToolResult) => void;
@@ -40,11 +47,17 @@ export async function runAgentLoop(
   const logger = new SessionLogger(opts.sessionId);
   const messages: ChatMessage[] = [{ role: 'user', content: initialTask }];
 
+  // Filter out disabled tools
+  const activeTools = opts.disabledTools?.length
+    ? TOOL_DEFINITIONS.filter(t => !opts.disabledTools!.includes(t.name))
+    : TOOL_DEFINITIONS;
+
   let turns = 0;
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
   let finalSummary = 'Task completed.';
   let finalAnswerFound = false;
+  let budgetWarningSent = false;
   const isOpenRouter = opts.provider === 'openrouter';
 
   while (turns < opts.maxTurns) {
@@ -62,27 +75,32 @@ export async function runAgentLoop(
       pendingToolCalls = [];
       turnInputTokens = 0;
       turnOutputTokens = 0;
+      const spinner = ora({ text: 'Thinking…', color: 'cyan', isEnabled: process.stdout.isTTY === true }).start();
+      let spinnerStopped = false;
+      const stopSpinner = () => { if (!spinnerStopped) { spinnerStopped = true; spinner.stop(); } };
       try {
         const stream = isOpenRouter
           ? streamOpenRouter(messages, {
               model: opts.model,
               maxTokens: 8096,
               systemPrompt: opts.systemPrompt,
-              tools: TOOL_DEFINITIONS,
+              tools: activeTools,
               apiKey: process.env.OPENROUTER_API_KEY || '',
             })
           : streamCompletion(messages, {
               model: opts.model,
               maxTokens: 8096,
               systemPrompt: opts.systemPrompt,
-              tools: TOOL_DEFINITIONS,
+              tools: activeTools,
             });
 
         for await (const chunk of stream) {
           if (chunk.type === 'text' && chunk.text) {
+            stopSpinner();
             assistantText += chunk.text;
             opts.onText?.(chunk.text);
           } else if (chunk.type === 'tool_call' && chunk.toolCall) {
+            stopSpinner();
             pendingToolCalls.push(chunk.toolCall);
           } else if (chunk.type === 'usage' && chunk.usage) {
             // Track per-turn usage; accumulate to totals after stream succeeds
@@ -90,6 +108,7 @@ export async function runAgentLoop(
             turnOutputTokens = chunk.usage.outputTokens;
           }
         }
+        stopSpinner();
         // Accumulate per-turn tokens into session totals
         totalInputTokens += turnInputTokens;
         totalOutputTokens += turnOutputTokens;
@@ -97,6 +116,13 @@ export async function runAgentLoop(
           ? calculateOpenRouterCost(opts.model, totalInputTokens, totalOutputTokens)
           : calculateCost(opts.model, totalInputTokens, totalOutputTokens);
         opts.onCostUpdate?.(cost, { input: totalInputTokens, output: totalOutputTokens });
+
+        // Proactive budget warning at 75%
+        if (opts.budgetUsd && !budgetWarningSent && cost >= opts.budgetUsd * 0.75 && cost < opts.budgetUsd) {
+          budgetWarningSent = true;
+          const pct = Math.round((cost / opts.budgetUsd) * 100);
+          console.log(chalk.yellow(`\n  ⚠  Budget warning: ${pct}% used ($${cost.toFixed(4)} of $${opts.budgetUsd.toFixed(2)})`));
+        }
 
         // Enforce budget limit
         if (opts.budgetUsd && cost > opts.budgetUsd) {
@@ -112,6 +138,7 @@ export async function runAgentLoop(
 
         break; // stream completed successfully
       } catch (err) {
+        stopSpinner();
         const error = err instanceof Error ? err : new Error(String(err));
         const isTransient = /ECONNRESET|ETIMEDOUT|rate.?limit|overloaded|503|529/i.test(error.message);
         if (!isTransient || streamAttempt >= 2) throw error;
@@ -147,54 +174,59 @@ export async function runAgentLoop(
     const finalAnswerCall = pendingToolCalls.find((tc) => tc.name === 'final_answer');
     const actionableCalls = pendingToolCalls.filter((tc) => tc.name !== 'final_answer');
 
-    // Execute tool calls
     const toolResults: Array<{ type: 'tool_result'; tool_use_id: string; content: string }> = [];
 
+    // Phase 1 — serial approvals (can't parallelize interactive prompts)
+    const approvalMap = new Map<string, boolean>();
     for (const tc of actionableCalls) {
       const call: ToolCall = { name: tc.name, input: tc.input };
       const risk = classifyRisk(call);
-
       if (opts.onToolStart) await opts.onToolStart(call);
-
-      // Show diff preview for write operations
       if (call.name === 'write_file' || call.name === 'edit_file') {
         await showDiffPreview(call, opts.cwd);
       }
-
-      // Request approval from Warden
       const approved = await requestApproval(call, opts.mode, risk);
-
+      approvalMap.set(tc.id, approved);
       if (!approved) {
-        const result: ToolResult = {
-          success: false,
-          output: '',
-          error: 'User denied this action.',
-          duration_ms: 0,
-        };
+        const result: ToolResult = { success: false, output: '', error: 'User denied this action.', duration_ms: 0 };
         opts.onToolEnd?.(call, result);
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: tc.id,
-          content: JSON.stringify(result),
-        });
-        await logger.log({ toolName: call.name, input: call.input, result, approved: false, riskLevel: risk });
-        continue;
+        if (opts.logSessions !== false) await logger.log({ toolName: call.name, input: call.input, result, approved: false, riskLevel: risk });
       }
+    }
 
-      const result = await executeTool(call, opts.cwd, opts.askUserFn);
-      opts.onToolEnd?.(call, result);
+    // Phase 2 — parallel execution of approved tools
+    // Fall back to concurrency=1 if any ask_user tool is in the batch (TTY safety)
+    const hasAskUser = actionableCalls.some(tc => tc.name === 'ask_user');
+    const concurrency = hasAskUser ? 1 : (opts.parallelTools ?? 3);
+    const queue = new PQueue({ concurrency });
+    const resultSlots = new Map<string, { type: 'tool_result'; tool_use_id: string; content: string }>();
 
-      await logger.log({ toolName: call.name, input: call.input, result, approved: true, riskLevel: risk });
+    await Promise.all(
+      actionableCalls
+        .filter(tc => approvalMap.get(tc.id) === true)
+        .map(tc => queue.add(async () => {
+          const call: ToolCall = { name: tc.name, input: tc.input };
+          const risk = classifyRisk(call);
+          const result = await executeTool(
+            call, opts.cwd, opts.askUserFn,
+            opts.commandTimeout ?? 30_000,
+            opts.searchMaxFiles ?? 100,
+          );
+          opts.onToolEnd?.(call, result);
+          if (opts.logSessions !== false) await logger.log({ toolName: call.name, input: call.input, result, approved: true, riskLevel: risk });
+          const content = result.success ? result.output : `ERROR: ${result.error}\n${result.output}`;
+          resultSlots.set(tc.id, { type: 'tool_result', tool_use_id: tc.id, content: content || '(no output)' });
+        }))
+    );
 
-      const resultContent = result.success
-        ? result.output
-        : `ERROR: ${result.error}\n${result.output}`;
-
-      toolResults.push({
-        type: 'tool_result',
-        tool_use_id: tc.id,
-        content: resultContent || '(no output)',
-      });
+    // Rebuild results in original call order
+    for (const tc of actionableCalls) {
+      if (approvalMap.get(tc.id) === false) {
+        toolResults.push({ type: 'tool_result', tool_use_id: tc.id, content: 'ERROR: User denied this action.' });
+      } else {
+        const slot = resultSlots.get(tc.id);
+        if (slot) toolResults.push(slot);
+      }
     }
 
     if (toolResults.length > 0) {

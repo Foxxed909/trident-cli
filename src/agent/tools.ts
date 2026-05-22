@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, unlink, readdir, lstat } from 'fs/promises';
+import { readFile, writeFile, mkdir, rename, unlink, readdir, lstat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { resolve, relative, dirname } from 'path';
 import { execa } from 'execa';
@@ -13,10 +13,14 @@ export interface ToolResult {
 
 export type ToolName =
   | 'read_file'
+  | 'read_file_range'
   | 'write_file'
   | 'edit_file'
   | 'delete_file'
   | 'list_dir'
+  | 'glob_files'
+  | 'create_dir'
+  | 'move_file'
   | 'run_command'
   | 'search_codebase'
   | 'web_fetch'
@@ -33,12 +37,12 @@ export interface EditOperation {
   new_str: string;
 }
 
-const TIMEOUT_MS = 30_000;
-
 export async function executeTool(
   call: ToolCall,
   cwd: string,
-  askUserFn: (q: string) => Promise<string>
+  askUserFn: (q: string) => Promise<string>,
+  timeoutMs = 30_000,
+  searchMaxFiles = 100,
 ): Promise<ToolResult> {
   const start = Date.now();
 
@@ -51,6 +55,25 @@ export async function executeTool(
         }
         const content = await readFile(filePath, 'utf-8');
         return { success: true, output: content, duration_ms: Date.now() - start };
+      }
+
+      case 'read_file_range': {
+        const { path: rfPath, start_line, end_line } = call.input as { path: string; start_line: number; end_line: number };
+        const absPath = resolve(cwd, rfPath);
+        if (!existsSync(absPath)) {
+          return { success: false, output: '', error: `File not found: ${absPath}`, duration_ms: Date.now() - start };
+        }
+        const allLines = (await readFile(absPath, 'utf-8')).split(/\r?\n/);
+        const totalLines = allLines.length;
+        const s = Math.max(1, start_line);
+        const e = Math.min(totalLines, end_line);
+        if (s > totalLines) {
+          return { success: false, output: '', error: `start_line ${start_line} exceeds file length (${totalLines} lines)`, duration_ms: Date.now() - start };
+        }
+        const numbered = allLines.slice(s - 1, e)
+          .map((line, i) => `${String(s + i).padStart(6)}: ${line}`)
+          .join('\n');
+        return { success: true, output: `${relative(cwd, absPath)} (lines ${s}–${e} of ${totalLines}):\n${numbered}`, duration_ms: Date.now() - start };
       }
 
       case 'write_file': {
@@ -100,6 +123,26 @@ export async function executeTool(
         return { success: true, output: `Deleted: ${relative(cwd, absPath)}`, duration_ms: Date.now() - start };
       }
 
+      case 'create_dir': {
+        const absPath = resolve(cwd, call.input.path as string);
+        await mkdir(absPath, { recursive: true });
+        return { success: true, output: `Created: ${relative(cwd, absPath)}`, duration_ms: Date.now() - start };
+      }
+
+      case 'move_file': {
+        const { src, dest } = call.input as { src: string; dest: string };
+        const absSrc = resolve(cwd, src);
+        const absDest = resolve(cwd, dest);
+        if (!existsSync(absSrc)) {
+          return { success: false, output: '', error: `Source not found: ${absSrc}`, duration_ms: Date.now() - start };
+        }
+        const destExisted = existsSync(absDest);
+        await mkdir(dirname(absDest), { recursive: true });
+        await rename(absSrc, absDest);
+        const note = destExisted ? ' (overwrote existing file — undo restores destination only)' : '';
+        return { success: true, output: `Moved: ${relative(cwd, absSrc)} → ${relative(cwd, absDest)}${note}`, duration_ms: Date.now() - start };
+      }
+
       case 'list_dir': {
         const { path: dirPath, recursive = false } = call.input as { path: string; recursive?: boolean };
         const absPath = resolve(cwd, dirPath);
@@ -120,6 +163,19 @@ export async function executeTool(
         }
       }
 
+      case 'glob_files': {
+        const { pattern, cwd: globCwd } = call.input as { pattern: string; cwd?: string };
+        const basePath = globCwd ? resolve(cwd, globCwd) : cwd;
+        const files = await fg(pattern, {
+          cwd: basePath,
+          ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**', '**/.next/**'],
+          dot: false,
+          followSymbolicLinks: false,
+        });
+        const relFiles = files.map(f => relative(cwd, resolve(basePath, f))).sort();
+        return { success: true, output: relFiles.join('\n') || '(no matches)', duration_ms: Date.now() - start };
+      }
+
       case 'run_command': {
         const { cmd, cwd: cmdCwd } = call.input as { cmd: string; cwd?: string };
         const execCwd = cmdCwd ? resolve(cwd, cmdCwd) : cwd;
@@ -131,7 +187,7 @@ export async function executeTool(
           cwd: execCwd,
           all: true,
           reject: false,
-          timeout: TIMEOUT_MS,
+          timeout: timeoutMs,
           maxBuffer: 10 * 1024 * 1024,
         });
 
@@ -147,7 +203,7 @@ export async function executeTool(
           return {
             success: false,
             output: output.slice(-4000),
-            error: `Command timed out after ${TIMEOUT_MS}ms`,
+            error: `Command timed out after ${timeoutMs}ms`,
             duration_ms: Date.now() - start,
           };
         }
@@ -163,7 +219,7 @@ export async function executeTool(
       }
 
       case 'search_codebase': {
-        const { query, glob } = call.input as { query: string; glob?: string };
+        const { query, glob, mode = 'literal' } = call.input as { query: string; glob?: string; mode?: 'literal' | 'regex' };
         const pattern = glob || '**/*.{ts,tsx,js,jsx,mjs,cjs,py,go,rs,java,rb,php,cs,cpp,c,h,hpp,md,json,yml,yaml,toml}';
         const files = await fg(pattern, {
           cwd,
@@ -173,11 +229,24 @@ export async function executeTool(
           followSymbolicLinks: false,
         });
 
-        const needle = query.toLowerCase();
+        let matcher: (line: string) => boolean;
+        if (mode === 'regex') {
+          let re: RegExp;
+          try {
+            re = new RegExp(query, 'i');
+          } catch {
+            return { success: false, output: '', error: `Invalid regex: "${query}"`, duration_ms: Date.now() - start };
+          }
+          matcher = (line) => re.test(line);
+        } else {
+          const needle = query.toLowerCase();
+          matcher = (line) => line.toLowerCase().includes(needle);
+        }
+
         const matches: string[] = [];
         let totalHits = 0;
-        const MAX_FILES = 30;
-        const MAX_LINES_PER_FILE = 5;
+        const MAX_FILES = searchMaxFiles;
+        const MAX_LINES_PER_FILE = 10;
         let filesWithMatches = 0;
         let truncatedFiles = 0;
 
@@ -189,23 +258,30 @@ export async function executeTool(
             continue;
           }
           const lines = content.split(/\r?\n/);
-          const hits: string[] = [];
+          const fileOutput: string[] = [];
           let hiddenHits = 0;
+          const shownLineIndices = new Set<number>();
+
           for (let i = 0; i < lines.length; i++) {
-            if (lines[i].toLowerCase().includes(needle)) {
-              if (hits.length < MAX_LINES_PER_FILE) {
-                hits.push(`  ${i + 1}: ${lines[i].slice(0, 200)}`);
-                totalHits++;
-              } else {
-                hiddenHits++;
-              }
+            if (!matcher(lines[i])) continue;
+            if (fileOutput.length >= MAX_LINES_PER_FILE) { hiddenHits++; continue; }
+
+            totalHits++;
+            // Context: 1 line before and after, deduplicated
+            const ctxStart = Math.max(0, i - 1);
+            const ctxEnd = Math.min(lines.length - 1, i + 1);
+            for (let c = ctxStart; c <= ctxEnd; c++) {
+              if (shownLineIndices.has(c)) continue;
+              shownLineIndices.add(c);
+              const prefix = c === i ? '>' : ' ';
+              fileOutput.push(`${prefix} ${String(c + 1).padStart(5)}: ${lines[c].slice(0, 200)}`);
             }
           }
-          if (hits.length > 0) {
+          if (fileOutput.length > 0) {
             filesWithMatches++;
             if (matches.length < MAX_FILES) {
-              const suffix = hiddenHits > 0 ? `\n  … and ${hiddenHits} more line(s) in this file` : '';
-              matches.push(`\n${rel}\n${hits.join('\n')}${suffix}`);
+              const suffix = hiddenHits > 0 ? `\n  … and ${hiddenHits} more hit(s) in this file` : '';
+              matches.push(`\n${rel}\n${fileOutput.join('\n')}${suffix}`);
             } else {
               truncatedFiles++;
             }
@@ -228,7 +304,7 @@ export async function executeTool(
         let resp: Response;
         try {
           resp = await fetch(url, {
-            signal: AbortSignal.timeout(TIMEOUT_MS),
+            signal: AbortSignal.timeout(timeoutMs),
             headers: { 'User-Agent': 'TRIDENT-CLI/1.0' },
           });
         } catch (e) {
@@ -268,11 +344,24 @@ export async function executeTool(
 export const TOOL_DEFINITIONS = [
   {
     name: 'read_file',
-    description: 'Read the contents of a file',
+    description: 'Read the full contents of a file. For large files (>200 lines) prefer read_file_range.',
     input_schema: {
       type: 'object',
       properties: { path: { type: 'string', description: 'Path to the file' } },
       required: ['path'],
+    },
+  },
+  {
+    name: 'read_file_range',
+    description: 'Read a specific range of lines from a file (1-indexed, inclusive). Use this instead of read_file for large files when you know which section you need.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Path to the file' },
+        start_line: { type: 'number', description: 'First line to read (1-indexed, inclusive)' },
+        end_line: { type: 'number', description: 'Last line to read (1-indexed, inclusive)' },
+      },
+      required: ['path', 'start_line', 'end_line'],
     },
   },
   {
@@ -319,6 +408,27 @@ export const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'create_dir',
+    description: 'Create a directory (and any required parent directories)',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'Directory path to create' } },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'move_file',
+    description: 'Move or rename a file. Creates destination directories as needed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        src:  { type: 'string', description: 'Source file path' },
+        dest: { type: 'string', description: 'Destination file path' },
+      },
+      required: ['src', 'dest'],
+    },
+  },
+  {
     name: 'list_dir',
     description: 'List directory contents',
     input_schema: {
@@ -328,6 +438,18 @@ export const TOOL_DEFINITIONS = [
         recursive: { type: 'boolean', description: 'List recursively' },
       },
       required: ['path'],
+    },
+  },
+  {
+    name: 'glob_files',
+    description: 'List files matching a glob pattern. Use this to find files by name or extension (e.g. "src/**/*.ts").',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Glob pattern, e.g. "src/**/*.ts" or "**/*.test.js"' },
+        cwd: { type: 'string', description: 'Optional base directory (defaults to project root)' },
+      },
+      required: ['pattern'],
     },
   },
   {
@@ -344,12 +466,13 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: 'search_codebase',
-    description: 'Search for a literal string across codebase files (case-insensitive). Optional glob narrows the search.',
+    description: 'Search for a string across codebase files. Returns matches with context lines. Use mode:"regex" for pattern searches (e.g. function signatures, imports).',
     input_schema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Search string (literal, case-insensitive)' },
-        glob: { type: 'string', description: 'Optional glob pattern (e.g. "src/**/*.ts") to limit search' },
+        query: { type: 'string', description: 'Search string (literal) or regex pattern' },
+        glob: { type: 'string', description: 'Optional glob pattern to limit search (e.g. "src/**/*.ts")' },
+        mode: { type: 'string', enum: ['literal', 'regex'], description: 'Search mode — literal (default) or regex' },
       },
       required: ['query'],
     },

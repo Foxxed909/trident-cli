@@ -163,7 +163,25 @@ export async function runOnboarding(): Promise<void> {
     },
   ]);
 
-  // ── Step 6: Session Logging ──────────────────────────────────────────────────
+  // ── Step 6: Budget (optional) ────────────────────────────────────────────────
+  section('Session Budget (optional)');
+  console.log('  ' + chalk.hex(SLATE)('Set a maximum spend per session to prevent runaway API costs.'));
+  console.log('  ' + chalk.hex(SLATE)('You can change this anytime with /budget or trident config budgetUsd.'));
+  console.log('');
+  const { budgetInput } = await inquirer.prompt([
+    {
+      type: 'input',
+      name: 'budgetInput',
+      message: chalk.hex(TEAL)('Max spend per session in USD? (e.g. 1.00 — or press Enter to skip):'),
+      default: '',
+    },
+  ]);
+  if (budgetInput && !isNaN(parseFloat(budgetInput)) && parseFloat(budgetInput) > 0) {
+    setConfig('budgetUsd', parseFloat(budgetInput));
+    console.log('  ' + chalk.hex(TEAL)(`✓ Budget set to $${parseFloat(budgetInput).toFixed(2)} per session.`));
+  }
+
+  // ── Step 7: Session Logging ──────────────────────────────────────────────────
   section('Session Logging');
   console.log('  ' + chalk.hex(SLATE)('TRIDENT can log all agent actions to ~/.trident/logs/'));
   console.log('  ' + chalk.hex(SLATE)('Run "trident review" anytime to inspect past sessions.'));

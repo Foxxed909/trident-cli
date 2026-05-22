@@ -134,7 +134,9 @@ export function printToolEnd(call: ToolCall, result: ToolResult): void {
 }
 
 function shouldShowOutput(call: ToolCall): boolean {
-  return call.name === 'read_file' || call.name === 'list_dir' || call.name === 'search_codebase' || call.name === 'run_command';
+  return call.name === 'read_file' || call.name === 'read_file_range'
+    || call.name === 'list_dir' || call.name === 'glob_files'
+    || call.name === 'search_codebase' || call.name === 'run_command';
 }
 
 function firstLine(s: string, max: number): string {
@@ -261,9 +263,12 @@ export function printSlashHelp(): void {
       label: 'Agent',
       cmds: [
         ['/retry',           're-run the last task'],
+        ['/replay <n>',      're-run task number n from history'],
         ['/undo',            'revert last file write or edit'],
         ['/save [file]',     'save session transcript to a file'],
         ['/compact',         'summarise & trim session history'],
+        ['/tools',           'list all available agent tools'],
+        ['/logging [on|off]','toggle session logging'],
       ],
     },
     {
@@ -338,9 +343,13 @@ function formatToolPreview(call: ToolCall): string {
     case 'read_file':
     case 'write_file':
     case 'edit_file':
-    case 'delete_file': return call.input.path as string;
+    case 'delete_file':
+    case 'create_dir':  return call.input.path as string;
+    case 'read_file_range': return `${call.input.path as string}:${call.input.start_line}–${call.input.end_line}`;
+    case 'glob_files':  return call.input.pattern as string;
+    case 'move_file':   return `${truncate(call.input.src as string, 35)} → ${truncate(call.input.dest as string, 35)}`;
     case 'list_dir':    return (call.input.path as string) + (call.input.recursive ? ' (recursive)' : '');
-    case 'search_codebase': return `"${truncate(call.input.query as string, 60)}"`;
+    case 'search_codebase': return `"${truncate(call.input.query as string, 60)}"${call.input.mode === 'regex' ? ' [regex]' : ''}`;
     case 'web_fetch':   return call.input.url as string;
     case 'ask_user':    return `"${truncate(call.input.question as string, 60)}"`;
     case 'final_answer': return '';

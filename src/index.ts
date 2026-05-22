@@ -467,7 +467,8 @@ async function runTrident(
 
   printInfo('Loading project context...');
   const ctx = await loadOrCreateContext(cwd);
-  const systemPrompt = buildSystemPrompt(ctx);
+  ctx.userName = config.userName;
+  const systemPrompt = buildSystemPrompt(ctx, model);
 
   printSessionHeader({ model, mode, provider, project: ctx.name, hasTridentMd: !!ctx.tridentMdContent });
 
@@ -576,6 +577,32 @@ async function runTrident(
           session.tokens.output += result.totalTokens.output;
           session.turns += result.turns;
           taskHistory.push({ task: lastTask, summary: result.summary, cost: result.totalCost });
+        }
+        return true;
+      }
+
+      case 'replay': {
+        if (!arg) {
+          printError(`Usage: /replay <n>  (use /history to see task numbers, 1–${taskHistory.length})`);
+          return true;
+        }
+        const replayIdx = parseInt(arg, 10) - 1;
+        if (isNaN(replayIdx) || replayIdx < 0 || replayIdx >= taskHistory.length) {
+          printError(`No task #${arg}. Run /history to see ${taskHistory.length} available task(s).`);
+          return true;
+        }
+        const taskToReplay = taskHistory[replayIdx].task;
+        printInfo(`Replaying task #${parseInt(arg, 10)}: ${taskToReplay}`);
+        const replayResult = await executeTask(taskToReplay, {
+          model: session.model, mode: session.mode, provider: session.provider,
+          maxTurns, budgetUsd: session.budget, systemPrompt, cwd, askUserFn, undoStack,
+        });
+        if (replayResult) {
+          session.cost += replayResult.totalCost;
+          session.tokens.input += replayResult.totalTokens.input;
+          session.tokens.output += replayResult.totalTokens.output;
+          session.turns += replayResult.turns;
+          taskHistory.push({ task: taskToReplay, summary: replayResult.summary, cost: replayResult.totalCost });
         }
         return true;
       }
@@ -732,6 +759,34 @@ async function runTrident(
         printInfo(`TRIDENT CLI v1.0.0`);
         return true;
 
+      case 'tools': {
+        const TEAL_T = '#5EEAD4';
+        const SLATE_T = '#94A3B8';
+        console.log('');
+        console.log('  ' + chalk.hex(TEAL_T).bold('Available agent tools'));
+        console.log('');
+        for (const tool of (await import('./agent/tools.js')).TOOL_DEFINITIONS) {
+          console.log(`    ${chalk.hex(TEAL_T)(tool.name.padEnd(22))} ${chalk.hex(SLATE_T)(tool.description)}`);
+        }
+        console.log('');
+        return true;
+      }
+
+      case 'logging': {
+        if (!arg) {
+          printInfo(`Session logging is ${config.logSessions ? 'ON' : 'OFF'}. Use /logging on|off to change.`);
+        } else if (arg === 'on') {
+          setConfig('logSessions', true);
+          printSuccess('Session logging → ON');
+        } else if (arg === 'off') {
+          setConfig('logSessions', false);
+          printSuccess('Session logging → OFF');
+        } else {
+          printError('Usage: /logging on | off');
+        }
+        return true;
+      }
+
       case 'models':
         await program.commands.find(c => c.name() === 'models')?.parseAsync([], { from: 'user' });
         return true;
@@ -828,21 +883,27 @@ async function executeTask(
     undoStack?: UndoEntry[];
   }
 ): Promise<Awaited<ReturnType<typeof runAgentLoop>> | null> {
+  const taskConfig = getConfig();
   printSectionHeader(`FORGE · ${opts.provider} · ${opts.model}`);
   console.log(chalk.dim(`  ${task}`));
   console.log('');
 
   const sessionId = randomUUID();
 
+  let budgetWarned = false;
+
   const onToolStart = async (call: import('./agent/tools.js').ToolCall): Promise<void> => {
-    // Snapshot file content before write/edit/delete for undo support
-    if (opts.undoStack && (call.name === 'write_file' || call.name === 'edit_file' || call.name === 'delete_file')) {
-      const filePath = pathResolve(opts.cwd, call.input.path as string);
+    // Snapshot file content before mutating operations for undo support
+    if (opts.undoStack && (call.name === 'write_file' || call.name === 'edit_file'
+      || call.name === 'delete_file' || call.name === 'move_file')) {
+      const snapPath = call.name === 'move_file'
+        ? pathResolve(opts.cwd, call.input.dest as string)
+        : pathResolve(opts.cwd, call.input.path as string);
       let originalContent: string | null = null;
       try {
-        originalContent = await fsReadFile(filePath, 'utf-8');
+        originalContent = await fsReadFile(snapPath, 'utf-8');
       } catch { /* file doesn't exist yet */ }
-      opts.undoStack.push({ path: filePath, originalContent });
+      opts.undoStack.push({ path: snapPath, originalContent });
     }
     printToolStart(call);
   };
@@ -856,11 +917,22 @@ async function executeTask(
       systemPrompt: opts.systemPrompt,
       maxTurns: opts.maxTurns,
       budgetUsd: opts.budgetUsd,
+      logSessions: taskConfig.logSessions,
+      commandTimeout: taskConfig.commandTimeout,
+      searchMaxFiles: taskConfig.searchMaxFiles,
+      parallelTools: taskConfig.parallelTools,
+      disabledTools: taskConfig.disabledTools,
       sessionId,
       onText: printAgentText,
       onToolStart,
       onToolEnd: printToolEnd,
-      onCostUpdate: () => {},
+      onCostUpdate: (cost) => {
+        if (opts.budgetUsd && !budgetWarned && cost >= opts.budgetUsd * 0.75 && cost < opts.budgetUsd) {
+          budgetWarned = true;
+          const pct = Math.round((cost / opts.budgetUsd) * 100);
+          printWarn(`Budget: ${pct}% used ($${cost.toFixed(4)} of $${opts.budgetUsd.toFixed(2)})`);
+        }
+      },
       askUserFn: opts.askUserFn,
     });
 
