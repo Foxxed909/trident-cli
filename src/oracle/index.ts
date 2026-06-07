@@ -1,8 +1,36 @@
-import { readFile, writeFile, readdir } from 'fs/promises';
+import { readFile, writeFile, readdir, mkdir, appendFile, unlink } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, basename } from 'path';
+import { homedir } from 'os';
 import fg from 'fast-glob';
 import { buildProfileSystemPrompt, type TrainedProfile } from '../profiles.js';
+
+const MEMORY_DIR = join(homedir(), '.trident');
+const MEMORY_FILE = join(MEMORY_DIR, 'memory.md');
+
+export async function loadMemory(): Promise<string> {
+  if (!existsSync(MEMORY_FILE)) {
+    return '';
+  }
+  try {
+    return await readFile(MEMORY_FILE, 'utf-8');
+  } catch {
+    return '';
+  }
+}
+
+export async function appendMemory(fact: string): Promise<void> {
+  await mkdir(MEMORY_DIR, { recursive: true });
+  const date = new Date().toISOString().slice(0, 10);
+  const entry = `[${date}] ${fact}\n`;
+  await appendFile(MEMORY_FILE, entry, 'utf-8');
+}
+
+export async function clearMemory(): Promise<void> {
+  if (existsSync(MEMORY_FILE)) {
+    await unlink(MEMORY_FILE);
+  }
+}
 
 export interface ProjectContext {
   name: string;
