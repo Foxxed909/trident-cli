@@ -1,236 +1,271 @@
-# 🔱 TRIDENT CLI
+# TRIDENT CLI
 
-> **Three Prongs. One Power. All Yours.**
-
-TRIDENT is an all-powerful agentic AI coding assistant that runs entirely in your terminal. Inspired by Claude Code, OpenAI Codex CLI, and Qwen Code CLI — built to surpass them all.
-
----
-
-## Architecture: The Three Prongs
-
-```
-🔱 TRIDENT
-├── ⚡ FORGE     — Agentic coding engine (tool loop, file ops, shell execution)
-├── 🔮 ORACLE    — Project context engine (TRIDENT.md, framework detection, tree scanning)
-└── 🛡 WARDEN    — Safety & approval layer (risk classification, diffs, session logging)
-```
-
----
+TRIDENT is an agentic coding CLI that runs in the terminal with project context, tool use, approval controls, and session logging.
 
 ## Quickstart
 
 ### 1. Install
 
 ```bash
-# Clone or copy this project, then:
 npm install
+npm run build
 
-# Make globally available
+# optional: make `trident` available on your PATH
 npm link
-
-# Or run directly:
-npx tsx src/index.ts
 ```
 
-### 2. Set your API key
+### 2. Set an API key
+
+TRIDENT can run against Anthropic, OpenRouter, or the local Codex CLI.
 
 ```bash
+# macOS / Linux
 export ANTHROPIC_API_KEY=sk-ant-...
+export OPENROUTER_API_KEY=sk-or-...
+
+# PowerShell
+$env:ANTHROPIC_API_KEY="sk-ant-..."
+$env:OPENROUTER_API_KEY="sk-or-..."
 ```
 
-### 3. Run doctor check
+Only one provider key is required for Anthropic/OpenRouter. The default provider is `anthropic`.
+
+For Codex-powered profiles, make sure the local Codex CLI is installed and logged in:
+
+```bash
+codex --version
+codex doctor
+```
+
+### 3. Check your environment
 
 ```bash
 trident doctor
 ```
 
-### 4. Initialize your project
+### 4. Initialize project context
 
 ```bash
-cd /your/project
-trident init   # Generates TRIDENT.md — the AI memory file
+trident init
 ```
 
-### 5. Start building
+This creates `TRIDENT.md` in the current project.
+
+### 5. Run it
 
 ```bash
-trident                           # Interactive mode
-trident "add input validation"    # One-shot task
+trident
+trident "add input validation to the config loader"
 ```
-
----
 
 ## Commands
 
 | Command | Description |
-|---------|-------------|
-| `trident` | Interactive REPL mode |
-| `trident "task"` | One-shot task execution |
-| `trident init` | Generate TRIDENT.md for current project |
-| `trident config` | Show full configuration |
+|---|---|
+| `trident` | Start interactive mode |
+| `trident "task"` | Run a one-shot task |
+| `trident init` | Generate `TRIDENT.md` for the current project |
+| `trident models` | List available models for each provider |
+| `trident profiles` | List trained TRIDENT profiles |
+| `trident train` | Prepare the five Codex-powered prompt profiles |
+| `trident config` | Show current config |
 | `trident config <key> <value>` | Set a config value |
-| `trident doctor` | Check environment & API keys |
-| `trident review` | Review last session action log |
-| `trident --help` | Show all options |
+| `trident doctor` | Check environment and API keys |
+| `trident review` | Review the latest session action log |
+| `trident heal` | Diagnose common issues |
+| `trident heal --reset-config` | Reset config to defaults if invalid |
+| `trident heal --regen-md` | Regenerate `TRIDENT.md` in the current project |
 
-### Flags
+## Flags
 
 | Flag | Description |
-|------|-------------|
-| `-m, --model <model>` | Override model (e.g. `claude-opus-4-5`) |
-| `--mode <mode>` | Approval mode: `yolo`, `review`, `lockdown` |
-| `--max-turns <n>` | Max agent loop iterations (default: 50) |
-| `--budget <usd>` | Max spend in USD for this session |
+|---|---|
+| `-m, --model <model>` | Override model |
+| `-p, --provider <provider>` | Provider: `anthropic`, `openrouter`, or `codex` |
+| `--mode <mode>` | Approval mode: `yolo`, `review`, or `lockdown` |
+| `--max-turns <n>` | Max agent loop iterations |
+| `--budget <usd>` | Max spend in USD for the current session |
+| `--profile <name>` | Use a trained profile: `Sydney`, `mercedes`, `Cipher`, `XAVIER`, or `Berry-Ski` |
+| `--system-override <text>` | Add an operator override that wins over profile output style |
+| `--codex-model <model>` | Optional Codex CLI model override when `--provider codex` |
+| `--codex-timeout <ms>` | Timeout for `codex exec` runs |
 
-### Interactive Commands
+## Interactive commands
 
-While in interactive mode:
-- `exit` or `quit` — Exit TRIDENT
-- `init` — Generate TRIDENT.md
-- `mode yolo|review|lockdown` — Switch approval mode
-- `model <name>` — Switch model
+Plain text without a leading `/` is sent to the agent as a task.
 
----
+### Session
 
-## Approval Modes
+- `/help` - show slash-command help
+- `/status` - show model, provider, mode, cost, budget, and token totals
+- `/cost` - alias for `/status`
+- `/history` - show tasks run in the current session
+- `/clear` - clear the screen
+- `/exit` - quit
+- `/` then Enter - open the command picker
+
+### Agent
+
+- `/retry` - re-run the last task
+- `/undo` - revert the last approved file write or edit
+- `/save [file]` - save the current session transcript to a Markdown file
+- `/compact` - trim session history and clear the undo stack
+- `/budget` - show the current session budget
+- `/budget <usd>` - set the current session budget
+- `/budget clear` - clear the current session budget
+- `/profile [name|clear]` - show or switch the trained profile
+- `/profiles` - list trained profiles
+- `/override [text|clear]` - show, set, or clear the operator system override
+
+### Project
+
+- `/init` - generate `TRIDENT.md`
+- `/context` - print the current `TRIDENT.md`
+- `/tree` - show the project file tree
+- `/cwd` - show the working directory
+
+### Config
+
+- `/model <name>` - switch model; model names containing `/` are treated as OpenRouter models
+- `/provider anthropic|openrouter|codex` - switch provider
+- `/mode yolo|review|lockdown` - switch approval mode
+- `/yolo` - shortcut for `/mode yolo`
+- `/safe` - shortcut for `/mode review`
+- `/lock` - shortcut for `/mode lockdown`
+- `/models` - list available models
+- `/profiles` - list trained profiles
+- `/sessions` - list recent session log files
+
+## Approval modes
 
 | Mode | Description |
-|------|-------------|
-| `review` (default) | Auto-approve reads; ask for writes, shell, destructive |
-| `yolo` | Auto-approve everything — fastest, zero interruptions |
-| `lockdown` | Ask for every single action — maximum safety |
-
-### Risk Classification
-
-Every tool call is classified before execution:
-
-| Risk | Color | Actions |
-|------|-------|---------|
-| `READ` | 🟢 Green | read_file, list_dir, search, web_fetch |
-| `WRITE` | 🟡 Yellow | write_file, edit_file |
-| `EXECUTE` | 🟣 Magenta | run_command |
-| `DESTRUCTIVE` | 🔴 Red | delete_file |
-
----
-
-## TRIDENT.md — Project Memory
-
-TRIDENT reads `TRIDENT.md` from your project root and injects it into every agent prompt. This gives the AI persistent knowledge about your project.
-
-```markdown
-# TRIDENT Project Context
-
-## Project
-- Name, languages, frameworks, package manager
-
-## Commands
-- Install, dev, test, build, lint
-
-## Do Not Touch
-- Files/dirs TRIDENT should never modify
-
-## Context for AI
-- Any conventions, rules, or extra context you want TRIDENT to know
-```
-
-Run `trident init` to auto-generate it. Edit it freely.
-
----
-
-## Agent Tools
-
-TRIDENT's agent has access to 10 tools:
-
-| Tool | Description |
-|------|-------------|
-| `read_file` | Read file contents |
-| `write_file` | Write/create a file |
-| `edit_file` | Surgical string-replace edits |
-| `delete_file` | Delete a file (DESTRUCTIVE) |
-| `list_dir` | List directory (with recursive option) |
-| `run_command` | Execute shell commands |
-| `search_codebase` | Grep across project files |
-| `web_fetch` | Fetch URLs (docs, APIs) |
-| `ask_user` | Ask you a clarifying question |
-| `final_answer` | Signal task completion |
-
-All tools have a 30-second timeout and full session logging.
-
----
+|---|---|
+| `review` | Auto-approve reads; confirm writes, commands, and destructive actions |
+| `yolo` | Auto-approve everything |
+| `lockdown` | Confirm every action |
 
 ## Configuration
 
+TRIDENT stores config through `conf`. You can inspect the resolved path with:
+
 ```bash
-trident config                        # Show all config
-trident config model claude-sonnet-4-5  # Switch model
-trident config mode yolo              # Default to YOLO mode
-trident config maxTurns 100           # More iterations
+trident config
 ```
 
-Config stored at `~/.trident-cli/config.json`.
+Current config keys:
 
----
+- `model`
+- `provider`
+- `mode`
+- `maxTurns`
+- `budgetUsd`
+- `logSessions`
+- `onboarded`
+- `userName`
+- `profile`
+- `systemOverride`
+- `codexModel`
+- `codexTimeoutMs`
 
-## Session Logs
+Examples:
 
-All actions are logged to `~/.trident/logs/<session-id>.jsonl`.
+```bash
+trident config provider openrouter
+trident config model openai/gpt-oss-20b:free
+trident config provider codex
+trident config profile Sydney
+trident config systemOverride "Answer with concise implementation summaries."
+trident config mode review
+trident config maxTurns 30
+trident config budgetUsd 5
+trident config logSessions false
+```
 
-Review the latest session:
+## Session logs
+
+When `logSessions` is enabled, TRIDENT writes JSONL session logs to:
+
+```text
+~/.trident/logs/<session-id>.jsonl
+```
+
+Review the most recent log with:
+
 ```bash
 trident review
 ```
 
-Each log entry contains: timestamp, tool name, input, result, approved/denied, risk level.
-
----
+Each entry records the timestamp, tool name, input, result, approval state, and risk level.
 
 ## Models
 
-TRIDENT uses Anthropic's models by default:
+Default Anthropic model:
 
-| Model | Best For |
-|-------|----------|
-| `claude-opus-4-5` | Complex agentic tasks (default) |
-| `claude-sonnet-4-5` | Balanced speed/quality |
-| `claude-haiku-4-5-20251001` | Fast, cheap tasks |
+- `claude-sonnet-4-6`
 
----
+You can also switch to OpenRouter and use any compatible model id, for example:
 
-## Project Structure
+- `openai/gpt-4o`
+- `openai/gpt-oss-20b:free`
 
+List the currently exposed model sets with:
+
+```bash
+trident models
 ```
+
+### Codex-powered trained profiles
+
+TRIDENT includes five prompt-trained operating profiles that can run through the local Codex CLI:
+
+- `Sydney` - product-minded full-stack builder
+- `mercedes` - systems reliability engineer
+- `Cipher` - security and bug-hunting specialist
+- `XAVIER` - architecture and reasoning lead
+- `Berry-Ski` - fast prototype and polish finisher
+
+Use them with:
+
+```bash
+trident --provider codex --profile Sydney "review this repo and fix the highest-impact bug"
+trident --provider codex --profile Cipher --system-override "Prioritize path traversal and command execution risks." "audit tools"
+```
+
+`trident train` verifies the Codex CLI path and lists the five trained profiles. This is prompt/profile training, not model weight fine-tuning.
+
+## Project structure
+
+```text
 trident/
-├── src/
-│   ├── index.ts              ← CLI entry point & interactive REPL
-│   ├── config.ts             ← Config management (conf-backed)
-│   ├── agent/
-│   │   ├── loop.ts           ← Main agent loop (streaming + tool calling)
-│   │   └── tools.ts          ← Tool definitions + executors
-│   ├── providers/
-│   │   └── anthropic.ts      ← Streaming Anthropic provider
-│   ├── oracle/
-│   │   └── index.ts          ← Project scanner, TRIDENT.md, system prompt
-│   ├── ui/
-│   │   ├── renderer.ts       ← Terminal UI (chalk-based)
-│   │   └── diff.ts           ← Colored diff viewer
-│   └── warden/
-│       └── index.ts          ← Risk classifier, approval, session logger
-├── package.json
-├── tsconfig.json
-└── README.md
+|-- src/
+|   |-- index.ts
+|   |-- config.ts
+|   |-- profiles.ts
+|   |-- agent/
+|   |   |-- loop.ts
+|   |   `-- tools.ts
+|   |-- oracle/
+|   |   `-- index.ts
+|   |-- providers/
+|   |   |-- anthropic.ts
+|   |   |-- codex.ts
+|   |   `-- openrouter.ts
+|   |-- ui/
+|   |   |-- onboarding.ts
+|   |   |-- renderer.ts
+|   |   `-- diff.ts
+|   `-- warden/
+|       `-- index.ts
+|-- scripts/
+|   `-- smoke-test.mjs
+|-- TRIDENT.md
+|-- package.json
+`-- README.md
 ```
 
----
+## Notes
 
-## Philosophy
-
-1. **Think before acting** — The agent plans before calling tools
-2. **Minimal blast radius** — Surgical edits preferred over full rewrites
-3. **Verify work** — Tests/linters run after changes when available
-4. **Ask when uncertain** — Clarification over wrong assumptions
-5. **Full transparency** — Every action logged, every risk shown
-6. **Complete tasks** — The agent doesn't stop until it's done
-
----
-
-*Built with ⚡ TypeScript, Anthropic SDK, Commander, Chalk, Inquirer, Execa*
+- Tool execution is restricted to the current workspace root.
+- Session budgets are enforced during agent runs.
+- Provider switching in interactive mode checks that the required API key is present before a request is sent.
+- Codex provider runs through `codex exec` with a timeout and captures the final Codex message.

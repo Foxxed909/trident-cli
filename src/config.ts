@@ -1,12 +1,13 @@
 import Conf from 'conf';
 import { z } from 'zod';
+import { TRAINED_PROFILE_NAMES } from './profiles.js';
 
 export const ConfigSchema = z.object({
-  model: z.string().default('claude-sonnet-4-6'),
-  provider: z.enum(['anthropic', 'openrouter']).default('anthropic'),
+  model: z.string().min(1).default('claude-sonnet-4-6'),
+  provider: z.enum(['anthropic', 'openrouter', 'codex']).default('anthropic'),
   mode: z.enum(['yolo', 'review', 'lockdown']).default('review'),
-  maxTurns: z.number().default(50),
-  budgetUsd: z.number().optional(),
+  maxTurns: z.number().int().positive().default(50),
+  budgetUsd: z.number().positive().optional(),
   theme: z.object({
     primary: z.string().default('#00D4FF'),
     accent: z.string().default('#FFD700'),
@@ -15,49 +16,69 @@ export const ConfigSchema = z.object({
   logSessions: z.boolean().default(true),
   onboarded: z.boolean().default(false),
   userName: z.string().default(''),
-});
+  profile: z.enum(TRAINED_PROFILE_NAMES).optional(),
+  systemOverride: z.string().default(''),
+  codexModel: z.string().default(''),
+  codexTimeoutMs: z.number().int().positive().default(180_000),
+}).strict();
 
 export type TridentConfig = z.infer<typeof ConfigSchema>;
+type RawConfig = Record<string, unknown>;
 
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
+const LEGACY_CONFIG_KEYS = new Set(['plan']);
 
-const store = new Conf<TridentConfig>({
+const store = new Conf<RawConfig>({
   projectName: 'trident-cli',
-  schema: {
-    model: { type: 'string', default: DEFAULT_MODEL },
-    provider: { type: 'string', default: 'anthropic' },
-    mode: { type: 'string', default: 'review' },
-    maxTurns: { type: 'number', default: 50 },
-    budgetUsd: { type: 'number' },
-    theme: { type: 'object' },
-    logSessions: { type: 'boolean', default: true },
-    onboarded: { type: 'boolean', default: false },
-    userName: { type: 'string', default: '' },
-  },
 });
 
 export function getConfig(): TridentConfig {
-  return {
-    model: (store.get('model') as string) || DEFAULT_MODEL,
-    provider: (store.get('provider') as TridentConfig['provider']) || 'anthropic',
-    mode: (store.get('mode') as TridentConfig['mode']) || 'review',
-    maxTurns: (store.get('maxTurns') as number) || 50,
-    budgetUsd: store.get('budgetUsd') as number | undefined,
-    theme: (store.get('theme') as TridentConfig['theme']) || {
-      primary: '#00D4FF',
-      accent: '#FFD700',
-      danger: '#FF4444',
-    },
-    logSessions: (store.get('logSessions') as boolean) ?? true,
-    onboarded: (store.get('onboarded') as boolean) ?? false,
-    userName: (store.get('userName') as string) || '',
-  };
+  const parsed = ConfigSchema.safeParse(getRawConfig());
+  if (parsed.success) {
+    return parsed.data;
+  }
+
+  const issue = parsed.error.issues[0];
+  const path = issue.path.length > 0 ? issue.path.join('.') : 'config';
+  throw new Error(`Invalid config at ${path}: ${issue.message}`);
 }
 
 export function setConfig(key: keyof TridentConfig, value: unknown): void {
   store.set(key, value);
 }
 
+export function deleteConfig(key: keyof TridentConfig): void {
+  store.delete(key);
+}
+
+export function getRawConfig(): RawConfig {
+  migrateLegacyConfigKeys();
+  return { ...store.store };
+}
+
+export function getDefaultConfig(): TridentConfig {
+  return ConfigSchema.parse({});
+}
+
+export function resetConfigToDefaults(): void {
+  for (const key of Object.keys(getRawConfig())) {
+    store.delete(key);
+  }
+
+  const defaults = getDefaultConfig();
+  for (const [key, value] of Object.entries(defaults)) {
+    store.set(key, value);
+  }
+}
+
 export function getConfigPath(): string {
   return store.path;
+}
+
+function migrateLegacyConfigKeys(): void {
+  for (const key of LEGACY_CONFIG_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(store.store, key)) {
+      store.delete(key);
+    }
+  }
 }

@@ -8,15 +8,17 @@ import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { execa } from 'execa';
+import { readFile as fsReadFile, writeFile as fsWriteFile, unlink as fsUnlink } from 'fs/promises';
 
-import { getConfig, setConfig, getConfigPath, ConfigSchema } from './config.js';
+import { getConfig, getRawConfig, getDefaultConfig, resetConfigToDefaults, setConfig, deleteConfig, getConfigPath, ConfigSchema } from './config.js';
 import type { TridentConfig } from './config.js';
 import { runOnboarding } from './ui/onboarding.js';
 import { loadOrCreateContext, generateTridentMd, buildSystemPrompt, generateProjectTree } from './oracle/index.js';
-import { runAgentLoop, type ProviderName } from './agent/loop.js';
+import { runAgentLoop, type ProviderName as AgentProviderName } from './agent/loop.js';
+import { resolveWorkspacePath } from './agent/tools.js';
 import { listOpenRouterModels } from './providers/openrouter.js';
-import { readFile as fsReadFile, writeFile as fsWriteFile, unlink as fsUnlink } from 'fs/promises';
-import { resolve as pathResolve } from 'path';
+import { codexSandboxForMode, isCodexCliAvailable, runCodexExec } from './providers/codex.js';
+import { formatProfileNames, listTrainedProfiles, resolveProfile, type TrainedProfile } from './profiles.js';
 import {
   printLogo,
   printSessionHeader,
@@ -37,30 +39,38 @@ import {
 
 const program = new Command();
 
+type TridentProviderName = AgentProviderName | 'codex';
+
 program
   .name('trident')
-  .description('🔱 TRIDENT — All-Powerful Agentic AI Coding CLI')
+  .description('TRIDENT - All-Powerful Agentic AI Coding CLI')
   .version('1.0.0');
 
-// ─── MAIN INTERACTIVE / ONE-SHOT COMMAND ─────────────────────────────────────
 program
   .argument('[task]', 'Task to execute (omit for interactive mode)')
   .option('-m, --model <model>', 'Model to use')
-  .option('-p, --provider <provider>', 'Provider: anthropic | openrouter')
+  .option('-p, --provider <provider>', 'Provider: anthropic | openrouter | codex')
   .option('--mode <mode>', 'Approval mode: yolo | review | lockdown')
   .option('--max-turns <n>', 'Max agent loop iterations', '50')
   .option('--budget <usd>', 'Max budget in USD')
+  .option('--profile <name>', `Trained profile: ${formatProfileNames()}`)
+  .option('--system-override <text>', 'Operator system override appended to the agent prompt')
+  .option('--codex-model <model>', 'Codex CLI model override (provider=codex only)')
+  .option('--codex-timeout <ms>', 'Codex CLI timeout in milliseconds')
   .action(async (task?: string, opts?: {
     model?: string;
     provider?: string;
     mode?: string;
     maxTurns?: string;
     budget?: string;
+    profile?: string;
+    systemOverride?: string;
+    codexModel?: string;
+    codexTimeout?: string;
   }) => {
     await runTrident(task, opts);
   });
 
-// ─── SUBCOMMANDS ──────────────────────────────────────────────────────────────
 program
   .command('init')
   .description('Generate TRIDENT.md for the current project')
@@ -70,39 +80,51 @@ program
     const cwd = process.cwd();
     const ctx = await loadOrCreateContext(cwd);
     await generateTridentMd(ctx, cwd);
-    printSuccess('Generated TRIDENT.md — edit it to customize AI behavior.');
+    printSuccess('Generated TRIDENT.md - edit it to customize AI behavior.');
   });
 
 program
   .command('models')
   .description('List available models for each provider')
   .action(() => {
-    console.log(chalk.hex('#00D4FF').bold('\n🔱 TRIDENT — Available Models\n'));
+    printAvailableModels();
+  });
 
-    console.log(chalk.bold('  ANTHROPIC (--provider anthropic)'));
-    const anthropicModels = [
-      ['claude-opus-4-7',           '$15 / $75 per M tokens'],
-      ['claude-sonnet-4-6',         '$3  / $15 per M tokens'],
-      ['claude-haiku-4-5-20251001', '$0.25 / $1.25 per M tokens'],
-    ];
-    for (const [m, p] of anthropicModels) {
-      console.log(`    ${chalk.white(m.padEnd(38))} ${chalk.dim(p)}`);
+program
+  .command('profiles')
+  .description('List Codex-trained TRIDENT profiles')
+  .action(() => {
+    printAvailableProfiles();
+  });
+
+program
+  .command('train')
+  .description('Prepare the five Codex-powered TRIDENT profiles')
+  .option('--set-default <profile>', 'Set provider=codex and choose a default trained profile')
+  .action(async (opts: { setDefault?: string }) => {
+    printLogo();
+    console.log(chalk.cyan('\nTRIDENT Profile Training\n'));
+    printInfo('Training here means installing prompt-trained operating profiles; it does not fine-tune model weights.');
+
+    const codexReady = await isCodexCliAvailable();
+    if (codexReady) {
+      printSuccess('Codex CLI is available.');
+    } else {
+      printWarn('Codex CLI was not found or did not respond to "codex --version".');
     }
 
-    console.log('');
-    console.log(chalk.bold('  OPENROUTER (--provider openrouter)'));
-    console.log(chalk.dim(listOpenRouterModels().replace(/\n/g, '\n  ')));
-    console.log('');
-    console.log(chalk.bold('  FREE MODELS (OpenRouter, no cost)'));
-    const freeModels = [
-      ['openai/gpt-oss-120b:free',              'free'],
-      ['openai/gpt-oss-20b:free',               'free'],
-      ['nvidia/nemotron-3-super-120b-a12b:free', 'free'],
-    ];
-    for (const [m, p] of freeModels) {
-      console.log(`    ${chalk.white(m.padEnd(42))} ${chalk.green(p)}`);
+    printAvailableProfiles();
+
+    if (opts.setDefault) {
+      const profile = resolveProfile(opts.setDefault);
+      if (!profile) {
+        printError(`Unknown profile "${opts.setDefault}". Valid profiles: ${formatProfileNames()}`);
+        process.exit(1);
+      }
+      setConfig('provider', 'codex');
+      setConfig('profile', profile.name);
+      printSuccess(`Default Codex profile set to ${profile.name}`);
     }
-    console.log('');
   });
 
 program
@@ -111,46 +133,141 @@ program
   .argument('[key]', 'Config key')
   .argument('[value]', 'Value to set')
   .action((key?: string, value?: string) => {
-    const config = getConfig();
+    const rawConfig = getRawConfig();
+    const validKeys = Object.keys(ConfigSchema.shape);
+
     if (!key) {
-      console.log(chalk.cyan('\n🔱 TRIDENT Configuration\n'));
-      console.log(JSON.stringify(config, null, 2));
+      const parsed = ConfigSchema.safeParse(rawConfig);
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0];
+        const path = issue.path.length > 0 ? issue.path.join('.') : 'config';
+        console.log(chalk.red(`Invalid config at ${path}: ${issue.message}`));
+        console.log(chalk.dim(`Config path: ${getConfigPath()}`));
+        console.log(chalk.dim('Run: trident heal --reset-config'));
+        process.exit(1);
+      }
+
+      console.log(chalk.cyan('\nTRIDENT Configuration\n'));
+      console.log(JSON.stringify(parsed.data, null, 2));
       console.log(chalk.dim(`\nConfig path: ${getConfigPath()}\n`));
-    } else if (key && value) {
+      return;
+    }
+
+    if (!validKeys.includes(key)) {
+      console.log(chalk.red(`Unknown config key: "${key}". Valid keys: ${validKeys.join(', ')}`));
+      process.exit(1);
+    }
+
+    if (key && value !== undefined) {
       let parsed: unknown = value;
       if (value === 'true') parsed = true;
       else if (value === 'false') parsed = false;
-      else if (!isNaN(Number(value))) parsed = Number(value);
+      else if (/^\s*[\[{]/.test(value)) {
+        try {
+          parsed = JSON.parse(value);
+        } catch {
+          console.log(chalk.red(`Invalid JSON value for ${key}: "${value}"`));
+          process.exit(1);
+        }
+      } else if (!Number.isNaN(Number(value))) parsed = Number(value);
 
-      // Validate key is a known config property
-      const validKeys = Object.keys(ConfigSchema.shape);
-      if (!validKeys.includes(key)) {
-        console.log(chalk.red(`✗ Unknown config key: "${key}". Valid keys: ${validKeys.join(', ')}`));
-        process.exit(1);
+      if (key === 'profile') {
+        if (/^(clear|unset|none)$/i.test(value)) {
+          deleteConfig('profile');
+          console.log(chalk.green('Cleared profile'));
+          return;
+        }
+        const profile = resolveProfile(value);
+        if (!profile) {
+          console.log(chalk.red(`Invalid value for profile: "${value}". Must be one of: ${formatProfileNames()}`));
+          process.exit(1);
+        }
+        parsed = profile.name;
       }
 
-      // Validate known keys before writing
-      if (key === 'mode' && !['yolo', 'review', 'lockdown'].includes(value)) {
-        console.log(chalk.red(`✗ Invalid value for mode: "${value}". Must be one of: yolo, review, lockdown`));
-        process.exit(1);
+      if (key === 'systemOverride' && /^(clear|unset|none)$/i.test(value)) {
+        parsed = '';
       }
-      if (key === 'maxTurns') {
+
+      if (key === 'codexModel' && /^(clear|unset|none)$/i.test(value)) {
+        parsed = '';
+      }
+
+      if (key === 'codexTimeoutMs') {
         const n = Number(value);
         if (!Number.isInteger(n) || n <= 0) {
-          console.log(chalk.red(`✗ Invalid value for maxTurns: "${value}". Must be a positive integer.`));
+          console.log(chalk.red(`Invalid value for codexTimeoutMs: "${value}". Must be a positive integer.`));
           process.exit(1);
         }
       }
-      if (key === 'provider' && !['anthropic', 'openrouter'].includes(value)) {
-        console.log(chalk.red(`✗ Invalid value for provider: "${value}". Must be one of: anthropic, openrouter`));
+
+      if (key === 'mode' && !['yolo', 'review', 'lockdown'].includes(value.toLowerCase())) {
+        console.log(chalk.red(`Invalid value for mode: "${value}". Must be one of: yolo, review, lockdown`));
         process.exit(1);
       }
 
-      setConfig(key as keyof typeof config, parsed);
-      console.log(chalk.green(`✓ Set ${key} = ${value}`));
-    } else {
-      console.log(`${key}: ${JSON.stringify(config[key as keyof typeof config])}`);
+      if (key === 'mode') {
+        parsed = value.toLowerCase();
+      }
+
+      if (key === 'maxTurns') {
+        const n = Number(value);
+        if (!Number.isInteger(n) || n <= 0) {
+          console.log(chalk.red(`Invalid value for maxTurns: "${value}". Must be a positive integer.`));
+          process.exit(1);
+        }
+      }
+
+      if (key === 'budgetUsd') {
+        if (/^(clear|unset|none)$/i.test(value)) {
+          deleteConfig('budgetUsd');
+          console.log(chalk.green('Cleared budgetUsd'));
+          return;
+        }
+
+        const n = Number(value);
+        if (!Number.isFinite(n) || n <= 0) {
+          console.log(chalk.red(`Invalid value for budgetUsd: "${value}". Must be a positive number.`));
+          process.exit(1);
+        }
+      }
+
+      if (key === 'provider' && !['anthropic', 'openrouter', 'codex'].includes(value.toLowerCase())) {
+        console.log(chalk.red(`Invalid value for provider: "${value}". Must be one of: anthropic, openrouter, codex`));
+        process.exit(1);
+      }
+
+      if (key === 'provider') {
+        parsed = value.toLowerCase();
+      }
+
+      const candidate = { ...getDefaultConfig(), ...rawConfig, [key]: parsed };
+      const validated = ConfigSchema.safeParse(candidate);
+      if (!validated.success) {
+        const issue = validated.error.issues[0];
+        const path = issue.path.length > 0 ? issue.path.join('.') : key;
+        console.log(chalk.red(`Invalid value for ${path}: ${issue.message}`));
+        if (key === 'theme') {
+          console.log(chalk.dim('Example: trident config theme {"primary":"#00D4FF","accent":"#FFD700","danger":"#FF4444"}'));
+        }
+        process.exit(1);
+      }
+
+      setConfig(key as keyof TridentConfig, parsed);
+      console.log(chalk.green(`Set ${key} = ${value}`));
+      return;
     }
+
+    const parsed = ConfigSchema.safeParse(rawConfig);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      const path = issue.path.length > 0 ? issue.path.join('.') : 'config';
+      console.log(chalk.red(`Invalid config at ${path}: ${issue.message}`));
+      console.log(chalk.dim('Run: trident heal --reset-config'));
+      process.exit(1);
+    }
+
+    console.log(`${key}: ${JSON.stringify(parsed.data[key as keyof typeof parsed.data])}`);
   });
 
 program
@@ -158,7 +275,7 @@ program
   .description('Check environment and dependencies')
   .action(async () => {
     printLogo();
-    console.log(chalk.cyan('\n🔱 TRIDENT Doctor\n'));
+    console.log(chalk.cyan('\nTRIDENT Doctor\n'));
 
     const isWindows = process.platform === 'win32';
     const shellExe = isWindows ? 'cmd' : 'bash';
@@ -174,30 +291,33 @@ program
     for (const check of checks) {
       try {
         const result = await execa(shellExe, [shellFlag, check.cmd], { reject: false });
-        console.log(`  ${chalk.green('✓')} ${check.name}: ${chalk.dim(result.stdout.split('\n')[0])}`);
+        console.log(`  ${chalk.green('OK')} ${check.name}: ${chalk.dim(result.stdout.split('\n')[0])}`);
       } catch {
-        console.log(`  ${chalk.red('✗')} ${check.name}: ${chalk.red('NOT FOUND')}`);
+        console.log(`  ${chalk.red('NO')} ${check.name}: ${chalk.red('NOT FOUND')}`);
       }
     }
 
     const hasAnthropic = !!process.env.ANTHROPIC_API_KEY;
     const hasOpenRouter = !!process.env.OPENROUTER_API_KEY;
+    const hasCodexCli = await isCodexCliAvailable();
 
     console.log('');
-    console.log(`  ${hasAnthropic ? chalk.green('✓') : chalk.red('✗')} ANTHROPIC_API_KEY:  ${hasAnthropic ? chalk.green('set') : chalk.red('NOT SET')}`);
-    console.log(`  ${hasOpenRouter ? chalk.green('✓') : chalk.yellow('○')} OPENROUTER_API_KEY: ${hasOpenRouter ? chalk.green('set') : chalk.yellow('not set (optional)')}`);
+    console.log(`  ${hasAnthropic ? chalk.green('OK') : chalk.red('NO')} ANTHROPIC_API_KEY:  ${hasAnthropic ? chalk.green('set') : chalk.red('NOT SET')}`);
+    console.log(`  ${hasOpenRouter ? chalk.green('OK') : chalk.yellow('--')} OPENROUTER_API_KEY: ${hasOpenRouter ? chalk.green('set') : chalk.yellow('not set (optional)')}`);
+    console.log(`  ${hasCodexCli ? chalk.green('OK') : chalk.yellow('--')} Codex CLI:          ${hasCodexCli ? chalk.green('available') : chalk.yellow('not available')}`);
 
-    if (!hasAnthropic && !hasOpenRouter) {
-      console.log(chalk.yellow('\n  → Set at least one API key:'));
-      console.log(chalk.dim('    export ANTHROPIC_API_KEY=sk-ant-...'));
-      console.log(chalk.dim('    export OPENROUTER_API_KEY=sk-or-...'));
+    if (!hasAnthropic && !hasOpenRouter && !hasCodexCli) {
+      console.log(chalk.yellow('\n  Set at least one API key:'));
+      console.log(chalk.dim(`    ${formatEnvAssignment('ANTHROPIC_API_KEY', 'sk-ant-...')}`));
+      console.log(chalk.dim(`    ${formatEnvAssignment('OPENROUTER_API_KEY', 'sk-or-...')}`));
+      console.log(chalk.dim('    Or install/login to Codex CLI for provider=codex.'));
     }
 
     console.log('');
-    if (hasAnthropic || hasOpenRouter) {
-      console.log(chalk.green('  🔱 TRIDENT is ready!\n'));
+    if (hasAnthropic || hasOpenRouter || hasCodexCli) {
+      console.log(chalk.green('  TRIDENT is ready!\n'));
     } else {
-      console.log(chalk.red('  ✗ Set at least one API key to use TRIDENT.\n'));
+      console.log(chalk.red('  Set at least one provider path to use TRIDENT.\n'));
     }
   });
 
@@ -205,30 +325,22 @@ program
   .command('review')
   .description('Review the last session action log')
   .action(async () => {
-    const { homedir } = await import('os');
-    const { readdir, readFile } = await import('fs/promises');
-    const logDir = join(homedir(), '.trident', 'logs');
-
-    if (!existsSync(logDir)) {
-      printError('No sessions logged yet.');
-      return;
-    }
-
-    const files = (await readdir(logDir)).sort().reverse();
+    const files = await getRecentSessionLogFiles();
     if (files.length === 0) {
       printError('No session logs found.');
       return;
     }
 
     const latest = files[0];
-    const content = await readFile(join(logDir, latest), 'utf-8');
-    const entries = content.trim().split('\n').flatMap((l) => {
-      try { return [JSON.parse(l)]; } catch { console.warn(`  [warn] Skipping malformed log line: ${l.slice(0, 60)}`); return []; }
-    });
+    const loaded = await loadLatestReviewableSession(files);
+    if (!loaded) {
+      printError('No readable session logs found.');
+      return;
+    }
 
-    console.log(chalk.cyan(`\n🔱 Session: ${latest.replace('.jsonl', '')}\n`));
-    for (const entry of entries) {
-      const icon = entry.approved ? chalk.green('✓') : chalk.red('✗');
+    console.log(chalk.cyan(`\nSession: ${loaded.file.replace('.jsonl', '')}\n`));
+    for (const entry of loaded.entries) {
+      const icon = entry.approved ? chalk.green('OK') : chalk.red('NO');
       const time = new Date(entry.timestamp).toLocaleTimeString();
       console.log(`  ${icon} [${chalk.dim(time)}] ${chalk.bold(entry.toolName)} ${chalk.dim(JSON.stringify(entry.input).slice(0, 60))}`);
     }
@@ -242,112 +354,102 @@ program
   .option('--regen-md', 'Regenerate TRIDENT.md for current project')
   .action(async (opts: { resetConfig?: boolean; regenMd?: boolean }) => {
     printLogo();
-    console.log(chalk.hex('#00D4FF').bold('\n🔱 TRIDENT Heal\n'));
+    console.log(chalk.hex('#00D4FF').bold('\nTRIDENT Heal\n'));
 
     let issues = 0;
     let fixed = 0;
 
-    // Check Node.js version
     const nodeMajor = parseInt(process.version.slice(1).split('.')[0], 10);
     if (nodeMajor < 18) {
-      console.log(`  ${chalk.red('✗')} Node.js ${process.version} — requires v18+`);
+      console.log(`  ${chalk.red('NO')} Node.js ${process.version} - requires v18+`);
       issues++;
     } else {
-      console.log(`  ${chalk.green('✓')} Node.js ${process.version}`);
+      console.log(`  ${chalk.green('OK')} Node.js ${process.version}`);
     }
 
-    // Check API keys
     const hasAnthropic = !!process.env.ANTHROPIC_API_KEY;
     const hasOpenRouter = !!process.env.OPENROUTER_API_KEY;
-    if (!hasAnthropic && !hasOpenRouter) {
-      console.log(`  ${chalk.red('✗')} No API keys set`);
-      console.log(chalk.dim('    → export ANTHROPIC_API_KEY=sk-ant-... or OPENROUTER_API_KEY=sk-or-...'));
+    const hasCodexCli = await isCodexCliAvailable();
+    if (!hasAnthropic && !hasOpenRouter && !hasCodexCli) {
+      console.log(`  ${chalk.red('NO')} No provider path available`);
+      console.log(chalk.dim(`    Use ${formatEnvAssignment('ANTHROPIC_API_KEY', 'sk-ant-...')} or ${formatEnvAssignment('OPENROUTER_API_KEY', 'sk-or-...')}`));
+      console.log(chalk.dim('    Or install/login to Codex CLI for provider=codex.'));
       issues++;
     } else {
-      if (hasAnthropic) console.log(`  ${chalk.green('✓')} ANTHROPIC_API_KEY set`);
-      if (hasOpenRouter) console.log(`  ${chalk.green('✓')} OPENROUTER_API_KEY set`);
+      if (hasAnthropic) console.log(`  ${chalk.green('OK')} ANTHROPIC_API_KEY set`);
+      if (hasOpenRouter) console.log(`  ${chalk.green('OK')} OPENROUTER_API_KEY set`);
+      if (hasCodexCli) console.log(`  ${chalk.green('OK')} Codex CLI available`);
     }
 
-    // Validate config
     try {
-      ConfigSchema.parse(getConfig());
-      console.log(`  ${chalk.green('✓')} Config valid (${getConfigPath()})`);
+      ConfigSchema.parse(getRawConfig());
+      console.log(`  ${chalk.green('OK')} Config valid (${getConfigPath()})`);
     } catch (err) {
-      console.log(`  ${chalk.red('✗')} Config invalid: ${err instanceof Error ? err.message : String(err)}`);
+      console.log(`  ${chalk.red('NO')} Config invalid: ${err instanceof Error ? err.message : String(err)}`);
       issues++;
       if (opts.resetConfig) {
-        const defaults = ConfigSchema.parse({});
-        for (const [k, v] of Object.entries(defaults)) {
-          setConfig(k as keyof TridentConfig, v);
-        }
-        console.log(`  ${chalk.green('→')} Config reset to defaults`);
+        resetConfigToDefaults();
+        console.log(`  ${chalk.green('OK')} Config reset to defaults`);
         fixed++;
       } else {
-        console.log(chalk.dim('    → Run: trident heal --reset-config to fix'));
+        console.log(chalk.dim('    Run: trident heal --reset-config'));
       }
     }
 
-    // Check TRIDENT.md
     const cwd = process.cwd();
     const tridentMdPath = join(cwd, 'TRIDENT.md');
     if (!existsSync(tridentMdPath)) {
-      console.log(`  ${chalk.yellow('⚠')} No TRIDENT.md in current directory`);
+      console.log(`  ${chalk.yellow('WARN')} No TRIDENT.md in current directory`);
       if (opts.regenMd) {
         const ctx = await loadOrCreateContext(cwd);
         await generateTridentMd(ctx, cwd);
-        console.log(`  ${chalk.green('→')} Generated TRIDENT.md`);
+        console.log(`  ${chalk.green('OK')} Generated TRIDENT.md`);
         fixed++;
       } else {
-        console.log(chalk.dim('    → Run: trident heal --regen-md to generate one'));
+        console.log(chalk.dim('    Run: trident heal --regen-md'));
       }
     } else {
-      console.log(`  ${chalk.green('✓')} TRIDENT.md present`);
+      console.log(`  ${chalk.green('OK')} TRIDENT.md present`);
     }
 
-    // Check shell availability
     try {
       const shellCmd = process.platform === 'win32' ? 'cmd' : 'bash';
       const shellFlag = process.platform === 'win32' ? '/c' : '-c';
       const { stdout } = await execa(shellCmd, [shellFlag, 'echo ok'], { reject: true });
       if (stdout.trim() === 'ok') {
-        console.log(`  ${chalk.green('✓')} Shell (${shellCmd}) available`);
+        console.log(`  ${chalk.green('OK')} Shell (${shellCmd}) available`);
       }
     } catch {
-      console.log(`  ${chalk.yellow('⚠')} Shell not available — run_command tool may not work`);
+      console.log(`  ${chalk.yellow('WARN')} Shell not available - run_command may not work`);
     }
 
     console.log('');
     if (issues === 0) {
-      console.log(chalk.green('  🔱 TRIDENT is healthy! No issues found.\n'));
+      console.log(chalk.green('  TRIDENT is healthy! No issues found.\n'));
     } else if (fixed > 0) {
-      console.log(chalk.yellow(`  🔱 Found ${issues} issue(s), fixed ${fixed}. Re-run to verify.\n`));
+      console.log(chalk.yellow(`  Found ${issues} issue(s), fixed ${fixed}. Re-run to verify.\n`));
     } else {
-      console.log(chalk.red(`  🔱 Found ${issues} issue(s). See suggestions above.\n`));
+      console.log(chalk.red(`  Found ${issues} issue(s). See suggestions above.\n`));
     }
   });
 
-// ─── MAIN FUNCTION ─────────────────────────────────────────────────────────────
-function resolveProvider(
-  cliProvider?: string,
-  configProvider?: string,
-  model?: string
-): ProviderName {
-  // Explicit CLI flag wins
-  if (cliProvider === 'openrouter') return 'openrouter';
-  if (cliProvider === 'anthropic') return 'anthropic';
-  // Auto-detect from model name (openrouter models contain a slash like "openai/gpt-4o")
+function resolveProvider(cliProvider?: string, configProvider?: string, model?: string): TridentProviderName {
+  const provider = cliProvider?.toLowerCase();
+  if (provider === 'openrouter') return 'openrouter';
+  if (provider === 'anthropic') return 'anthropic';
+  if (provider === 'codex') return 'codex';
   if (model && model.includes('/')) return 'openrouter';
-  // Fall back to config, then anthropic
-  return (configProvider as ProviderName) || 'anthropic';
+  if (configProvider === 'openrouter' || configProvider === 'anthropic' || configProvider === 'codex') {
+    return configProvider;
+  }
+  return 'anthropic';
 }
 
-// ─── SESSION UNDO STACK ───────────────────────────────────────────────────────
 interface UndoEntry {
   path: string;
-  originalContent: string | null; // null = file did not exist before the write
+  originalContent: string | null;
 }
 
-// ─── COMMAND PICKER (numbered menu, readline-compatible) ─────────────────────
 async function showCommandPicker(
   rl: ReturnType<typeof createInterface>,
   handleSlash: (raw: string) => Promise<boolean>
@@ -360,55 +462,59 @@ async function showCommandPicker(
     {
       label: 'Session',
       entries: [
-        { cmd: '/help',     desc: 'show all slash commands' },
-        { cmd: '/status',   desc: 'model / provider / mode / cost' },
-        { cmd: '/history',  desc: 'tasks run this session' },
-        { cmd: '/clear',    desc: 'clear the screen' },
-        { cmd: '/exit',     desc: 'quit trident' },
+        { cmd: '/help', desc: 'show all slash commands' },
+        { cmd: '/status', desc: 'model / provider / mode / cost' },
+        { cmd: '/history', desc: 'tasks run this session' },
+        { cmd: '/clear', desc: 'clear the screen' },
+        { cmd: '/exit', desc: 'quit trident' },
       ],
     },
     {
       label: 'Agent',
       entries: [
-        { cmd: '/retry',    desc: 're-run the last task' },
-        { cmd: '/undo',     desc: 'revert last file write or edit' },
-        { cmd: '/compact',  desc: 'trim session history & undo stack' },
-        { cmd: '/save',     desc: 'save session transcript to a .md file' },
+        { cmd: '/retry', desc: 're-run the last task' },
+        { cmd: '/undo', desc: 'revert last file write or edit' },
+        { cmd: '/compact', desc: 'trim session history and undo stack' },
+        { cmd: '/save', desc: 'save session transcript to a .md file' },
+        { cmd: '/budget', desc: 'show, set, or clear session budget' },
+        { cmd: '/profile', desc: 'show or switch trained profile' },
+        { cmd: '/override', desc: 'show or set system override' },
       ],
     },
     {
       label: 'Project',
       entries: [
-        { cmd: '/init',     desc: 'generate TRIDENT.md' },
-        { cmd: '/context',  desc: 'show TRIDENT.md contents' },
-        { cmd: '/tree',     desc: 'show project file tree' },
-        { cmd: '/cwd',      desc: 'show working directory' },
+        { cmd: '/init', desc: 'generate TRIDENT.md' },
+        { cmd: '/context', desc: 'show TRIDENT.md contents' },
+        { cmd: '/tree', desc: 'show project file tree' },
+        { cmd: '/cwd', desc: 'show working directory' },
       ],
     },
     {
       label: 'Config',
       entries: [
-        { cmd: '/yolo',     desc: 'mode → YOLO (approve all)' },
-        { cmd: '/safe',     desc: 'mode → REVIEW (confirm writes)' },
-        { cmd: '/lock',     desc: 'mode → LOCKDOWN (confirm everything)' },
-        { cmd: '/models',   desc: 'list available models' },
+        { cmd: '/yolo', desc: 'mode -> YOLO (approve all)' },
+        { cmd: '/safe', desc: 'mode -> REVIEW (confirm writes)' },
+        { cmd: '/lock', desc: 'mode -> LOCKDOWN (confirm everything)' },
+        { cmd: '/models', desc: 'list available models' },
+        { cmd: '/profiles', desc: 'list trained profiles' },
         { cmd: '/sessions', desc: 'list past session log files' },
       ],
     },
   ];
 
   console.log('');
-  console.log('  ' + chalk.hex(TEAL).bold('🔱 Command menu'));
+  console.log('  ' + chalk.hex(TEAL).bold('Command menu'));
   console.log('');
 
   let n = 1;
   const numToCmd: Record<number, string> = {};
 
   for (const { label, entries } of groups) {
-    console.log('  ' + chalk.hex(AMBER).dim(`── ${label} ──`));
+    console.log('  ' + chalk.hex(AMBER).dim(`-- ${label} --`));
     for (const { cmd, desc } of entries) {
       numToCmd[n] = cmd;
-      const num   = chalk.hex(SLATE).dim(String(n).padStart(2));
+      const num = chalk.hex(SLATE).dim(String(n).padStart(2));
       const cmdStr = chalk.hex(TEAL)(cmd.padEnd(12));
       const descStr = chalk.hex(SLATE)(desc);
       console.log(`    ${num}  ${cmdStr}  ${descStr}`);
@@ -420,7 +526,7 @@ async function showCommandPicker(
   return new Promise<void>((resolve) => {
     rl.question(chalk.hex(TEAL)('  Enter number (or Enter to cancel): '), async (answer) => {
       const chosen = parseInt(answer.trim(), 10);
-      if (!isNaN(chosen) && numToCmd[chosen]) {
+      if (!Number.isNaN(chosen) && numToCmd[chosen]) {
         await handleSlash(numToCmd[chosen]);
       }
       resolve();
@@ -430,44 +536,57 @@ async function showCommandPicker(
 
 async function runTrident(
   initialTask?: string,
-  cliOpts?: { model?: string; provider?: string; mode?: string; maxTurns?: string; budget?: string }
+  cliOpts?: {
+    model?: string;
+    provider?: string;
+    mode?: string;
+    maxTurns?: string;
+    budget?: string;
+    profile?: string;
+    systemOverride?: string;
+    codexModel?: string;
+    codexTimeout?: string;
+  }
 ): Promise<void> {
-  const config = getConfig();
+  let config: TridentConfig;
+  try {
+    config = getConfig();
+  } catch (err) {
+    printError(err instanceof Error ? err.message : String(err));
+    printInfo(`Config path: ${getConfigPath()}`);
+    printInfo('Run "trident heal --reset-config" to recover the config.');
+    process.exit(1);
+    return;
+  }
 
   if (!config.onboarded) {
     await runOnboarding();
-    // Re-read config so provider/model/mode reflect what was just saved
     Object.assign(config, getConfig());
   }
 
-  const model = cliOpts?.model || config.model;
+  let activeProfile = resolveConfiguredProfile(cliOpts?.profile, config.profile);
+  let systemOverride = cliOpts?.systemOverride ?? config.systemOverride;
   const mode = (cliOpts?.mode as typeof config.mode) || config.mode;
   let maxTurns = parseInt(cliOpts?.maxTurns || String(config.maxTurns), 10);
-  if (isNaN(maxTurns) || maxTurns <= 0) maxTurns = config.maxTurns;
-  const provider = resolveProvider(cliOpts?.provider, config.provider, model);
+  if (Number.isNaN(maxTurns) || maxTurns <= 0) maxTurns = config.maxTurns;
+  const budgetUsd = resolveBudget(cliOpts?.budget, config.budgetUsd);
+  const provider = resolveProvider(cliOpts?.provider, config.provider, cliOpts?.model || config.model);
+  const apiModel = cliOpts?.model || config.model;
+  const codexModel = cliOpts?.codexModel ?? config.codexModel;
+  const model = provider === 'codex' ? (codexModel || 'codex default') : apiModel;
+  const codexTimeoutMs = resolvePositiveInteger(cliOpts?.codexTimeout, config.codexTimeoutMs, 'codex timeout');
   const cwd = process.cwd();
-
-  // Check required API key for chosen provider
-  if (provider === 'openrouter' && !process.env.OPENROUTER_API_KEY) {
-    printError('OPENROUTER_API_KEY is not set.');
-    printInfo('Run: export OPENROUTER_API_KEY=sk-or-...');
-    printInfo('Get a key at: https://openrouter.ai/keys');
-    process.exit(1);
-  }
-  if (provider === 'anthropic' && !process.env.ANTHROPIC_API_KEY) {
-    printError('ANTHROPIC_API_KEY is not set.');
-    printInfo('Run: export ANTHROPIC_API_KEY=sk-ant-...');
-    printInfo('Or use OpenRouter: trident --provider openrouter --model openai/gpt-4o');
-    process.exit(1);
-  }
 
   printLogo();
 
   printInfo('Loading project context...');
   const ctx = await loadOrCreateContext(cwd);
-  const systemPrompt = buildSystemPrompt(ctx);
+  const getSystemPrompt = (): string => buildSystemPrompt(ctx, {
+    profile: activeProfile,
+    systemOverride,
+  });
 
-  printSessionHeader({ model, mode, provider, project: ctx.name, hasTridentMd: !!ctx.tridentMdContent });
+  printSessionHeader({ model, mode, provider, project: ctx.name, hasTridentMd: !!ctx.tridentMdContent, profile: activeProfile?.name });
 
   if (!ctx.tridentMdContent) {
     printInfo("No TRIDENT.md found. Run 'trident init' to generate one for better AI context.");
@@ -480,58 +599,116 @@ async function runTrident(
     return answer;
   };
 
-  // ONE-SHOT MODE
+  const ensureProviderReady = async (providerToCheck: TridentProviderName, soft = false): Promise<boolean> => {
+    if (providerToCheck === 'codex') {
+      if (await isCodexCliAvailable()) {
+        return true;
+      }
+      printError('Codex CLI is not available.');
+      printInfo('Run: codex --version');
+      printInfo('If Codex is installed but stale in this shell, open a new terminal or repair the global npm shim.');
+      if (!soft) {
+        process.exit(1);
+      }
+      return false;
+    }
+
+    const envKey = providerToCheck === 'openrouter' ? 'OPENROUTER_API_KEY' : 'ANTHROPIC_API_KEY';
+    const example = providerToCheck === 'openrouter' ? 'sk-or-...' : 'sk-ant-...';
+    const fallbackModel = providerToCheck === 'anthropic' ? 'openai/gpt-4o' : 'claude-sonnet-4-6';
+
+    if (process.env[envKey]) {
+      return true;
+    }
+
+    printError(`${envKey} is not set.`);
+    printInfo(`Run: ${formatEnvAssignment(envKey, example)}`);
+    if (providerToCheck === 'anthropic') {
+      printInfo(`Or use OpenRouter: trident --provider openrouter --model ${fallbackModel}`);
+    } else {
+      printInfo('Get a key at: https://openrouter.ai/keys');
+    }
+
+    if (!soft) {
+      process.exit(1);
+    }
+    return false;
+  };
+
+  await ensureProviderReady(provider);
+
   if (initialTask) {
-    await executeTask(initialTask, { model, mode, provider, maxTurns, systemPrompt, cwd, askUserFn });
+    await executeTask(initialTask, {
+      model,
+      mode,
+      provider,
+      maxTurns,
+      budgetUsd,
+      logSessions: config.logSessions,
+      systemPrompt: getSystemPrompt(),
+      profile: activeProfile,
+      codexTimeoutMs,
+      cwd,
+      askUserFn,
+    });
     return;
   }
 
-  // INTERACTIVE MODE
   printWelcome();
 
   const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
-
   const session = {
-    mode, model, provider,
+    mode,
+    model,
+    provider,
+    profile: activeProfile?.name,
+    systemOverride,
     cost: 0,
     tokens: { input: 0, output: 0 },
     turns: 0,
+    budgetUsd: budgetUsd ?? config.budgetUsd,
   };
-
-  // Undo stack — persists across tasks in the session
   const undoStack: UndoEntry[] = [];
-
-  // Task history — list of { task, summary } for /history
   const taskHistory: Array<{ task: string; summary: string; cost: number }> = [];
-
-  // Last task — for /retry
   let lastTask: string | null = null;
 
-  // ─── SLASH COMMAND HANDLER ────────────────────────────────────────────────
   const handleSlash = async (raw: string): Promise<boolean> => {
     const cmd = raw.slice(1).trim();
     const [head, ...rest] = cmd.split(/\s+/);
     const arg = rest.join(' ').trim();
 
     switch (head.toLowerCase()) {
-      // ── Help / Info ────────────────────────────────────────────────────────
-      case 'help': case '?':
+      case 'help':
+      case '?':
         printSlashHelp();
         return true;
 
-      case 'clear': case 'cls':
+      case 'clear':
+      case 'cls':
         process.stdout.write('\x1b[2J\x1b[H');
         return true;
 
-      case 'exit': case 'quit': case 'q':
-        console.log(chalk.hex('#5EEAD4')('\n🔱 signing off. stay powerful.\n'));
-        rl.close(); process.exit(0);
+      case 'exit':
+      case 'quit':
+      case 'q':
+        console.log(chalk.hex('#5EEAD4')('\nsigning off. stay powerful.\n'));
+        rl.close();
+        process.exit(0);
         return true;
 
-      case 'status': case 'cost':
+      case 'status':
+      case 'cost':
         printStatus({
-          model: session.model, provider: session.provider, mode: session.mode,
-          cost: session.cost, tokens: session.tokens, turns: session.turns,
+          model: session.model,
+          provider: session.provider,
+          mode: session.mode,
+          cost: session.cost,
+          budgetUsd: session.budgetUsd,
+          budgetRemainingUsd: remainingBudget(session),
+          tokens: session.tokens,
+          turns: session.turns,
+          profile: session.profile,
+          systemOverrideActive: session.systemOverride.trim().length > 0,
         });
         return true;
 
@@ -546,23 +723,38 @@ async function runTrident(
           const { task, summary, cost } = taskHistory[i];
           console.log('');
           console.log(`  ${chalk.hex('#94A3B8').dim(`${i + 1}.`)} ${chalk.white(task)}`);
-          console.log(`     ${chalk.hex('#94A3B8').dim('↳')} ${chalk.hex('#94A3B8')(summary.slice(0, 100))}${summary.length > 100 ? '…' : ''}`);
+          console.log(`     ${chalk.hex('#94A3B8').dim('->')} ${chalk.hex('#94A3B8')(summary.slice(0, 100))}${summary.length > 100 ? '...' : ''}`);
           console.log(`     ${chalk.hex('#94A3B8').dim('$' + cost.toFixed(4))}`);
         }
         console.log('');
         return true;
       }
 
-      // ── Agent ──────────────────────────────────────────────────────────────
       case 'retry': {
         if (!lastTask) {
           printWarn('No previous task to retry.');
           return true;
         }
         printInfo(`Retrying: ${lastTask}`);
+        if (session.budgetUsd !== undefined && session.cost >= session.budgetUsd) {
+          printWarn(`Session budget reached ($${session.budgetUsd.toFixed(2)}). Start a new session with a higher --budget to continue.`);
+          return true;
+        }
+        if (!(await ensureProviderReady(session.provider, true))) {
+          return true;
+        }
         const result = await executeTask(lastTask, {
-          model: session.model, mode: session.mode, provider: session.provider,
-          maxTurns, systemPrompt, cwd, askUserFn,
+          model: session.model,
+          mode: session.mode,
+          provider: session.provider,
+          maxTurns,
+          budgetUsd: remainingBudget(session),
+          logSessions: config.logSessions,
+          systemPrompt: getSystemPrompt(),
+          profile: activeProfile,
+          codexTimeoutMs,
+          cwd,
+          askUserFn,
           undoStack,
         });
         if (result) {
@@ -600,21 +792,115 @@ async function runTrident(
           printInfo('No history to compact.');
           return true;
         }
-        const kept = taskHistory.splice(-3); // keep last 3
+        const kept = taskHistory.splice(-3);
         taskHistory.length = 0;
         taskHistory.push(...kept);
         undoStack.length = 0;
-        printSuccess(`Compacted — kept last ${kept.length} task(s), undo stack cleared.`);
+        printSuccess(`Compacted - kept last ${kept.length} task(s), undo stack cleared.`);
+        return true;
+      }
+
+      case 'budget': {
+        if (!arg) {
+          if (session.budgetUsd === undefined) {
+            printInfo('No session budget is set.');
+          } else {
+            const remaining = Math.max(0, session.budgetUsd - session.cost);
+            printInfo(`Session budget: $${session.budgetUsd.toFixed(2)} total, $${remaining.toFixed(4)} remaining.`);
+          }
+          return true;
+        }
+
+        if (/^(clear|off|none)$/i.test(arg)) {
+          session.budgetUsd = undefined;
+          printSuccess('Session budget cleared.');
+          return true;
+        }
+
+        const parsed = Number(arg);
+        if (!isFiniteBudget(parsed)) {
+          printError('Usage: /budget <positive-usd-amount> | clear');
+          return true;
+        }
+
+        session.budgetUsd = parsed;
+        if (parsed <= session.cost) {
+          printWarn(`Budget set to $${parsed.toFixed(2)}, which is already exhausted by current session spend ($${session.cost.toFixed(4)}).`);
+        } else {
+          printSuccess(`Session budget set to $${parsed.toFixed(2)}.`);
+        }
+        return true;
+      }
+
+      case 'profile': {
+        if (!arg) {
+          printInfo(`Active profile: ${activeProfile ? activeProfile.name : 'none'}`);
+          printInfo(`Available profiles: ${formatProfileNames()}`);
+          return true;
+        }
+
+        if (/^(clear|off|none)$/i.test(arg)) {
+          activeProfile = null;
+          session.profile = undefined;
+          printSuccess('Trained profile cleared.');
+          return true;
+        }
+
+        const nextProfile = resolveProfile(arg);
+        if (!nextProfile) {
+          printError(`Unknown profile "${arg}". Valid profiles: ${formatProfileNames()}`);
+          return true;
+        }
+
+        activeProfile = nextProfile;
+        session.profile = nextProfile.name;
+        printSuccess(`profile -> ${nextProfile.name}`);
+        return true;
+      }
+
+      case 'profiles':
+        printAvailableProfiles();
+        return true;
+
+      case 'override': {
+        if (!arg) {
+          if (!session.systemOverride.trim()) {
+            printInfo('No system override is active.');
+          } else {
+            printInfo(`System override: ${session.systemOverride}`);
+          }
+          return true;
+        }
+
+        if (/^(clear|off|none)$/i.test(arg)) {
+          systemOverride = '';
+          session.systemOverride = '';
+          printSuccess('System override cleared.');
+          return true;
+        }
+
+        systemOverride = arg;
+        session.systemOverride = arg;
+        printSuccess('System override updated.');
         return true;
       }
 
       case 'save': {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
         const filename = arg || `trident-session-${ts}.md`;
+        let savePath: string;
+        try {
+          savePath = resolveWorkspacePath(cwd, filename);
+        } catch (err) {
+          printError(`Save failed: ${err instanceof Error ? err.message : String(err)}`);
+          return true;
+        }
+
         const lines: string[] = [
-          `# TRIDENT Session — ${new Date().toLocaleString()}`,
+          `# TRIDENT Session - ${new Date().toLocaleString()}`,
           '',
           `**Model:** ${session.model}  |  **Provider:** ${session.provider}  |  **Mode:** ${session.mode}`,
+          `**Profile:** ${session.profile || 'none'}  |  **Override:** ${session.systemOverride.trim() ? 'active' : 'none'}`,
           `**Total cost:** $${session.cost.toFixed(4)}  |  **Tokens:** ${(session.tokens.input + session.tokens.output).toLocaleString()}  |  **Turns:** ${session.turns}`,
           '',
           '## Tasks',
@@ -628,15 +914,14 @@ async function runTrident(
           lines.push('');
         }
         try {
-          await fsWriteFile(join(cwd, filename), lines.join('\n'), 'utf-8');
-          printSuccess(`Saved session to ${filename}`);
+          await fsWriteFile(savePath, lines.join('\n'), 'utf-8');
+          printSuccess(`Saved session to ${savePath}`);
         } catch (err) {
           printError(`Save failed: ${err instanceof Error ? err.message : String(err)}`);
         }
         return true;
       }
 
-      // ── Project ────────────────────────────────────────────────────────────
       case 'init': {
         const generated = await generateTridentMd(ctx, cwd);
         ctx.tridentMdContent = generated;
@@ -649,9 +934,9 @@ async function runTrident(
           printWarn('No TRIDENT.md in current directory. Run /init to create one.');
         } else {
           console.log('');
-          console.log(chalk.hex('#94A3B8').dim('─'.repeat(60)));
+          console.log(chalk.hex('#94A3B8').dim('-'.repeat(60)));
           console.log(ctx.tridentMdContent);
-          console.log(chalk.hex('#94A3B8').dim('─'.repeat(60)));
+          console.log(chalk.hex('#94A3B8').dim('-'.repeat(60)));
         }
         return true;
 
@@ -671,115 +956,170 @@ async function runTrident(
         printInfo(`Working directory: ${chalk.white(cwd)}`);
         return true;
 
-      // ── Config ─────────────────────────────────────────────────────────────
-      case 'mode': {
+      case 'mode':
         if (!arg || !/^(yolo|review|lockdown)$/i.test(arg)) {
           printError('Usage: /mode yolo | review | lockdown');
           return true;
         }
         session.mode = arg.toLowerCase() as typeof session.mode;
-        printSuccess(`mode → ${session.mode.toUpperCase()}`);
+        printSuccess(`mode -> ${session.mode.toUpperCase()}`);
         return true;
-      }
-      case 'yolo':     session.mode = 'yolo';     printSuccess('mode → YOLO');     return true;
-      case 'safe':     session.mode = 'review';   printSuccess('mode → REVIEW');   return true;
-      case 'lock':     session.mode = 'lockdown'; printSuccess('mode → LOCKDOWN'); return true;
+
+      case 'yolo':
+        session.mode = 'yolo';
+        printSuccess('mode -> YOLO');
+        return true;
+
+      case 'safe':
+        session.mode = 'review';
+        printSuccess('mode -> REVIEW');
+        return true;
+
+      case 'lock':
+        session.mode = 'lockdown';
+        printSuccess('mode -> LOCKDOWN');
+        return true;
 
       case 'provider': {
-        if (!arg || !/^(anthropic|openrouter)$/i.test(arg)) {
-          printError('Usage: /provider anthropic | openrouter');
+        if (!arg || !/^(anthropic|openrouter|codex)$/i.test(arg)) {
+          printError('Usage: /provider anthropic | openrouter | codex');
           return true;
         }
-        session.provider = arg.toLowerCase() as ProviderName;
-        printSuccess(`provider → ${session.provider}`);
+        const nextProvider = arg.toLowerCase() as TridentProviderName;
+        if (!(await ensureProviderReady(nextProvider, true))) {
+          return true;
+        }
+        session.provider = nextProvider;
+        if (nextProvider === 'codex' && session.model !== (codexModel || 'codex default')) {
+          session.model = codexModel || 'codex default';
+        } else if (nextProvider !== 'codex' && session.model === (codexModel || 'codex default')) {
+          session.model = apiModel;
+        }
+        printSuccess(`provider -> ${session.provider}`);
         return true;
       }
 
       case 'model': {
-        if (!arg) { printError('Usage: /model <name>'); return true; }
+        if (!arg) {
+          printError('Usage: /model <name>');
+          return true;
+        }
+        const nextProvider: TridentProviderName = session.provider === 'codex'
+          ? 'codex'
+          : arg.includes('/') ? 'openrouter' : session.provider;
+        if (!(await ensureProviderReady(nextProvider, true))) {
+          return true;
+        }
         session.model = arg;
-        if (session.model.includes('/')) session.provider = 'openrouter';
-        printSuccess(`model → ${session.model} (${session.provider})`);
+        session.provider = nextProvider;
+        printSuccess(`model -> ${session.model} (${session.provider})`);
         return true;
       }
 
       case 'models':
-        await program.commands.find(c => c.name() === 'models')?.parseAsync([], { from: 'user' });
+        printAvailableModels();
         return true;
 
       case 'sessions': {
-        const { homedir } = await import('os');
-        const { readdir } = await import('fs/promises');
-        const logDir = join(homedir(), '.trident', 'logs');
-        if (!existsSync(logDir)) { printInfo('No sessions yet.'); return true; }
-        const files = (await readdir(logDir)).sort().reverse().slice(0, 10);
-        if (files.length === 0) { printInfo('No sessions yet.'); return true; }
+        const files = await getRecentSessionLogFiles(10);
+        if (files.length === 0) {
+          printInfo('No sessions yet.');
+          return true;
+        }
         console.log('');
         console.log('  ' + chalk.hex('#5EEAD4').bold('Recent sessions'));
-        for (const f of files) console.log('    ' + chalk.dim(f.replace('.jsonl', '')));
+        for (const f of files) {
+          console.log('    ' + chalk.dim(f.replace('.jsonl', '')));
+        }
         console.log('');
         return true;
       }
 
       default:
-        printWarn(`Unknown command: /${head}. Type / + Enter for a menu, or /help for the list.`);
+        printWarn(`Unknown command: /${head}. Type / then Enter for the menu, or /help for the list.`);
         return true;
     }
   };
 
-  // ─── PROMPT LOOP ─────────────────────────────────────────────────────────
-  const promptLoop = (): void => {
-    printPrompt();
-    rl.once('line', async (input) => {
-      const task = input.trim();
-      if (!task) { promptLoop(); return; }
+  const handleInput = async (rawInput: string): Promise<void> => {
+    const task = rawInput.trim();
+    if (!task) {
+      return;
+    }
 
-      // Bare "/" → show numbered command menu
-      if (task === '/') {
-        await showCommandPicker(rl, handleSlash);
-        promptLoop();
-        return;
-      }
+    if (task === '/') {
+      await showCommandPicker(rl, handleSlash);
+      return;
+    }
 
-      // Slash commands
-      if (task.startsWith('/')) {
-        await handleSlash(task);
-        promptLoop(); return;
-      }
+    if (task.startsWith('/')) {
+      await handleSlash(task);
+      return;
+    }
 
-      // Backwards-compat shorthands without "/"
-      if (/^(exit|quit)$/i.test(task)) { await handleSlash('/exit'); return; }
-      if (/^init$/i.test(task)) { await handleSlash('/init'); promptLoop(); return; }
+    if (/^(exit|quit)$/i.test(task)) {
+      await handleSlash('/exit');
+      return;
+    }
 
-      lastTask = task;
+    if (/^init$/i.test(task)) {
+      await handleSlash('/init');
+      return;
+    }
 
-      const result = await executeTask(task, {
-        model: session.model,
-        mode: session.mode,
-        provider: session.provider,
-        maxTurns,
-        systemPrompt,
-        cwd,
-        askUserFn,
-        undoStack,
-      });
+    lastTask = task;
 
-      if (result) {
-        session.cost += result.totalCost;
-        session.tokens.input += result.totalTokens.input;
-        session.tokens.output += result.totalTokens.output;
-        session.turns += result.turns;
-        taskHistory.push({ task, summary: result.summary, cost: result.totalCost });
-      }
+    if (session.budgetUsd !== undefined && session.cost >= session.budgetUsd) {
+      printWarn(`Session budget reached ($${session.budgetUsd.toFixed(2)}). Start a new session with a higher --budget to continue.`);
+      return;
+    }
 
-      promptLoop();
+    if (!(await ensureProviderReady(session.provider, true))) {
+      return;
+    }
+
+    const result = await executeTask(task, {
+      model: session.model,
+      mode: session.mode,
+      provider: session.provider,
+      maxTurns,
+      budgetUsd: remainingBudget(session),
+      logSessions: config.logSessions,
+      systemPrompt: getSystemPrompt(),
+      profile: activeProfile,
+      codexTimeoutMs,
+      cwd,
+      askUserFn,
+      undoStack,
     });
+
+    if (result) {
+      session.cost += result.totalCost;
+      session.tokens.input += result.totalTokens.input;
+      session.tokens.output += result.totalTokens.output;
+      session.turns += result.turns;
+      taskHistory.push({ task, summary: result.summary, cost: result.totalCost });
+    }
   };
 
-  promptLoop();
+  if (process.stdin.isTTY) {
+    const promptLoop = (): void => {
+      printPrompt();
+      rl.once('line', async (input) => {
+        await handleInput(input);
+        promptLoop();
+      });
+    };
+
+    promptLoop();
+  } else {
+    for await (const input of rl) {
+      await handleInput(input);
+    }
+  }
 
   rl.on('close', () => {
-    console.log(chalk.hex('#5EEAD4')('\n🔱 signing off.\n'));
+    console.log(chalk.hex('#5EEAD4')('\nsigning off.\n'));
     process.exit(0);
   });
 }
@@ -788,32 +1128,73 @@ async function executeTask(
   task: string,
   opts: {
     model: string;
-    provider: ProviderName;
+    provider: TridentProviderName;
     mode: 'yolo' | 'review' | 'lockdown';
     maxTurns: number;
+    budgetUsd?: number;
+    logSessions: boolean;
     systemPrompt: string;
+    profile?: TrainedProfile | null;
+    codexTimeoutMs: number;
     cwd: string;
     askUserFn: (q: string) => Promise<string>;
     undoStack?: UndoEntry[];
   }
 ): Promise<Awaited<ReturnType<typeof runAgentLoop>> | null> {
-  printSectionHeader(`FORGE · ${opts.provider} · ${opts.model}`);
+  printSectionHeader(`FORGE - ${opts.provider} - ${opts.model}`);
   console.log(chalk.dim(`  ${task}`));
   console.log('');
+
+  if (opts.provider === 'codex') {
+    printInfo(`Running Codex CLI${opts.profile ? ` with ${opts.profile.name}` : ''} (${opts.mode} -> ${codexSandboxForMode(opts.mode)} sandbox).`);
+    try {
+      const codexResult = await runCodexExec({
+        cwd: opts.cwd,
+        task,
+        systemPrompt: opts.systemPrompt,
+        profile: opts.profile,
+        model: opts.model === 'codex default' ? '' : opts.model,
+        timeoutMs: opts.codexTimeoutMs,
+        sandbox: codexSandboxForMode(opts.mode),
+      });
+      const result = {
+        success: codexResult.success,
+        summary: codexResult.summary,
+        turns: 1,
+        totalCost: 0,
+        totalTokens: { input: 0, output: 0 },
+      };
+      printFinalSummary(result);
+      if (!codexResult.success) {
+        printWarn('Codex CLI did not complete successfully. Run "codex doctor" for details.');
+      }
+      return result;
+    } catch (err) {
+      console.log('');
+      printError(err instanceof Error ? err.message : String(err));
+      return null;
+    }
+  }
 
   const sessionId = randomUUID();
 
   const onToolStart = async (call: import('./agent/tools.js').ToolCall): Promise<void> => {
-    // Snapshot file content before write/edit/delete for undo support
-    if (opts.undoStack && (call.name === 'write_file' || call.name === 'edit_file' || call.name === 'delete_file')) {
-      const filePath = pathResolve(opts.cwd, call.input.path as string);
-      let originalContent: string | null = null;
-      try {
-        originalContent = await fsReadFile(filePath, 'utf-8');
-      } catch { /* file doesn't exist yet */ }
-      opts.undoStack.push({ path: filePath, originalContent });
-    }
     printToolStart(call);
+  };
+
+  const beforeToolExecute = async (call: import('./agent/tools.js').ToolCall): Promise<void> => {
+    if (!opts.undoStack || (call.name !== 'write_file' && call.name !== 'edit_file' && call.name !== 'delete_file')) {
+      return;
+    }
+
+    const filePath = resolveWorkspacePath(opts.cwd, call.input.path as string);
+    let originalContent: string | null = null;
+    try {
+      originalContent = await fsReadFile(filePath, 'utf-8');
+    } catch {
+      // File did not exist before this change.
+    }
+    opts.undoStack.push({ path: filePath, originalContent });
   };
 
   try {
@@ -821,12 +1202,15 @@ async function executeTask(
       cwd: opts.cwd,
       mode: opts.mode,
       model: opts.model,
-      provider: opts.provider,
+      provider: opts.provider as AgentProviderName,
       systemPrompt: opts.systemPrompt,
       maxTurns: opts.maxTurns,
+      budgetUsd: opts.budgetUsd,
+      logSessions: opts.logSessions,
       sessionId,
       onText: printAgentText,
       onToolStart,
+      beforeToolExecute,
       onToolEnd: printToolEnd,
       onCostUpdate: () => {},
       askUserFn: opts.askUserFn,
@@ -841,7 +1225,6 @@ async function executeTask(
   }
 }
 
-// ─── GLOBAL CRASH PROTECTION ──────────────────────────────────────────────────
 process.on('uncaughtException', (err) => {
   console.error('');
   printError(`Unexpected error: ${err.message}`);
@@ -858,3 +1241,166 @@ process.on('unhandledRejection', (reason) => {
 });
 
 program.parse();
+
+function resolveBudget(cliBudget?: string, configBudget?: number): number | undefined {
+  if (cliBudget === undefined || cliBudget === null || cliBudget === '') {
+    return isFiniteBudget(configBudget) ? configBudget : undefined;
+  }
+
+  const parsed = Number(cliBudget);
+  if (!isFiniteBudget(parsed)) {
+    printError(`Invalid budget: "${cliBudget}". Expected a positive number.`);
+    process.exit(1);
+  }
+  return parsed;
+}
+
+function isFiniteBudget(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
+function remainingBudget(session: { cost: number; budgetUsd?: number }): number | undefined {
+  if (session.budgetUsd === undefined) {
+    return undefined;
+  }
+  return Math.max(0, session.budgetUsd - session.cost);
+}
+
+function resolvePositiveInteger(cliValue: string | undefined, configValue: number, label: string): number {
+  if (cliValue === undefined || cliValue === null || cliValue === '') {
+    return configValue;
+  }
+
+  const parsed = Number(cliValue);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    printError(`Invalid ${label}: "${cliValue}". Expected a positive integer.`);
+    process.exit(1);
+  }
+  return parsed;
+}
+
+function resolveConfiguredProfile(cliProfile?: string, configProfile?: string): TrainedProfile | null {
+  const raw = cliProfile ?? configProfile;
+  if (!raw) {
+    return null;
+  }
+
+  const profile = resolveProfile(raw);
+  if (!profile) {
+    printError(`Unknown profile "${raw}". Valid profiles: ${formatProfileNames()}`);
+    process.exit(1);
+  }
+  return profile;
+}
+
+function formatEnvAssignment(key: string, value: string): string {
+  if (process.platform === 'win32') {
+    return `$env:${key}="${value}"`;
+  }
+  return `export ${key}=${value}`;
+}
+
+function printAvailableModels(): void {
+  console.log(chalk.hex('#00D4FF').bold('\nTRIDENT - Available Models\n'));
+
+  console.log(chalk.bold('  ANTHROPIC (--provider anthropic)'));
+  const anthropicModels = [
+    ['claude-opus-4-7', '$15 / $75 per M tokens'],
+    ['claude-sonnet-4-6', '$3  / $15 per M tokens'],
+    ['claude-haiku-4-5-20251001', '$0.25 / $1.25 per M tokens'],
+  ];
+  for (const [m, p] of anthropicModels) {
+    console.log(`    ${chalk.white(m.padEnd(38))} ${chalk.dim(p)}`);
+  }
+
+  console.log('');
+  console.log(chalk.bold('  OPENROUTER (--provider openrouter)'));
+  console.log(chalk.dim(listOpenRouterModels().replace(/\n/g, '\n  ')));
+  console.log('');
+  console.log(chalk.bold('  FREE MODELS (OpenRouter, no cost)'));
+  const freeModels = [
+    ['openai/gpt-oss-120b:free', 'free'],
+    ['openai/gpt-oss-20b:free', 'free'],
+    ['nvidia/nemotron-3-super-120b-a12b:free', 'free'],
+  ];
+  for (const [m, p] of freeModels) {
+    console.log(`    ${chalk.white(m.padEnd(42))} ${chalk.green(p)}`);
+  }
+  console.log('');
+  console.log(chalk.bold('  CODEX CLI (--provider codex)'));
+  console.log(chalk.dim('    Uses the locally installed Codex CLI and its configured/authenticated model.'));
+  console.log(chalk.dim('    Optional override: --codex-model <model>'));
+  console.log('');
+  printAvailableProfiles();
+  console.log('');
+}
+
+function printAvailableProfiles(): void {
+  console.log(chalk.bold('  TRIDENT TRAINED PROFILES'));
+  for (const profile of listTrainedProfiles()) {
+    console.log(`    ${chalk.white(profile.name.padEnd(12))} ${chalk.dim(profile.title)} - ${chalk.hex('#94A3B8')(profile.focus)}`);
+  }
+  console.log(chalk.dim('    Use: trident --provider codex --profile Sydney "task"'));
+}
+
+async function getRecentSessionLogFiles(limit?: number): Promise<string[]> {
+  const { homedir } = await import('os');
+  const { readdir, stat } = await import('fs/promises');
+  const logDir = join(homedir(), '.trident', 'logs');
+
+  if (!existsSync(logDir)) {
+    return [];
+  }
+
+  const names = (await readdir(logDir)).filter((name) => name.endsWith('.jsonl'));
+  const withMtime = await Promise.all(names.map(async (name) => ({
+    name,
+    mtimeMs: (await stat(join(logDir, name))).mtimeMs,
+  })));
+
+  withMtime.sort((a, b) => b.mtimeMs - a.mtimeMs || a.name.localeCompare(b.name));
+  const ordered = withMtime.map((entry) => entry.name);
+  return limit ? ordered.slice(0, limit) : ordered;
+}
+
+async function loadLatestReviewableSession(files: string[]): Promise<{
+  file: string;
+  entries: Array<{
+    timestamp: string;
+    approved: boolean;
+    toolName: string;
+    input: Record<string, unknown>;
+  }>;
+} | null> {
+  const { homedir } = await import('os');
+  const { readFile } = await import('fs/promises');
+  const logDir = join(homedir(), '.trident', 'logs');
+
+  for (const file of files) {
+    const content = await readFile(join(logDir, file), 'utf-8');
+    const lines = content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (lines.length === 0) {
+      continue;
+    }
+
+    const entries = lines.flatMap((line) => {
+      try {
+        return [JSON.parse(line) as {
+          timestamp: string;
+          approved: boolean;
+          toolName: string;
+          input: Record<string, unknown>;
+        }];
+      } catch {
+        console.warn(`  [warn] Skipping malformed log line in ${file}: ${line.slice(0, 60)}`);
+        return [];
+      }
+    });
+
+    if (entries.length > 0) {
+      return { file, entries };
+    }
+  }
+
+  return null;
+}

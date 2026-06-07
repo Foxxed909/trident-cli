@@ -3,7 +3,7 @@
 
 ## Project
 - **Name**: trident-cli
-- **Languages**: Unknown
+- **Languages**: TypeScript, JavaScript
 - **Frameworks**: None detected
 - **Package Manager**: npm
 
@@ -11,33 +11,39 @@
 ```
 Install:  npm install
 Dev:      npm run dev
-Test:     N/A
+Test:     npm run test
 Build:    npm run build
 Lint:     N/A
 ```
 
 ## Project Tree (top 3 levels)
 ```
-.
+./scripts
+./scripts/smoke-test.mjs
 ./src
-./src/ui
-./src/ui/diff.ts
-./src/ui/renderer.ts
-./src/index.ts
-./src/providers
-./src/providers/anthropic.ts
 ./src/agent
 ./src/agent/loop.ts
 ./src/agent/tools.ts
-./src/{agent,providers,ui,warden,oracle}
-./src/config.ts
 ./src/oracle
 ./src/oracle/index.ts
+./src/providers
+./src/providers/anthropic.ts
+./src/providers/codex.ts
+./src/providers/openrouter.ts
+./src/ui
+./src/ui/diff.ts
+./src/ui/onboarding.ts
+./src/ui/renderer.ts
 ./src/warden
 ./src/warden/index.ts
+./src/config.ts
+./src/index.ts
+./src/profiles.ts
+./.gitignore
 ./package-lock.json
-./node_modules
 ./package.json
+./README.md
+./TRIDENT.md
 ./tsconfig.json
 ```
 

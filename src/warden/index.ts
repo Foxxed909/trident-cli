@@ -1,13 +1,12 @@
 import chalk from 'chalk';
 import inquirer from 'inquirer';
-import { appendFile, mkdir } from 'fs/promises';
+import { appendFile } from 'fs/promises';
 import { existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import type { ToolCall } from '../agent/tools.js';
 
 export type ApprovalMode = 'yolo' | 'review' | 'lockdown';
-
 export type RiskLevel = 'read' | 'write' | 'execute' | 'destructive';
 
 export interface ActionLog {
@@ -35,7 +34,7 @@ export function classifyRisk(call: ToolCall): RiskLevel {
       return 'write';
 
     case 'run_command': {
-      const cmd = (call.input.cmd as string || '').trim();
+      const cmd = ((call.input.cmd as string) || '').trim();
       if (/(\brm\s+-rf?\b|\bdel\s+\/[sf]\b|\brmdir\b|\bformat\b|\bdrop\s+table\b|\btruncate\b|\bgit\s+reset\s+--hard\b|\bgit\s+clean\b)/i.test(cmd)) {
         return 'destructive';
       }
@@ -61,10 +60,10 @@ export function getRiskColor(level: RiskLevel): string {
 
 export function getRiskEmoji(level: RiskLevel): string {
   switch (level) {
-    case 'read': return '👁';
-    case 'write': return '✏️';
-    case 'execute': return '⚡';
-    case 'destructive': return '💥';
+    case 'read': return '[R]';
+    case 'write': return '[W]';
+    case 'execute': return '[X]';
+    case 'destructive': return '[!]';
   }
 }
 
@@ -73,39 +72,38 @@ export async function requestApproval(
   mode: ApprovalMode,
   risk: RiskLevel
 ): Promise<boolean> {
-  // YOLO: approve everything
-  if (mode === 'yolo') return true;
-
-  // LOCKDOWN: ask for everything
-  if (mode === 'lockdown') {
-    return await promptUser(call, risk);
+  if (mode === 'yolo') {
+    return true;
   }
 
-  // REVIEW: only ask for risky operations
+  if (mode === 'lockdown') {
+    return promptUser(call, risk);
+  }
+
   if (mode === 'review') {
-    if (risk === 'read') return true;
-    return await promptUser(call, risk);
+    if (risk === 'read') {
+      return true;
+    }
+    return promptUser(call, risk);
   }
 
   return true;
 }
 
 async function promptUser(call: ToolCall, risk: RiskLevel): Promise<boolean> {
-  // In non-interactive environments (CI, piped input) default to approve to avoid hanging
   if (!process.stdin.isTTY) {
     return risk !== 'destructive';
   }
 
   console.log('');
-  console.log(chalk.dim('─'.repeat(60)));
+  console.log(chalk.dim('-'.repeat(60)));
   console.log(`  ${getRiskEmoji(risk)} ${getRiskColor(risk)} ${chalk.bold(call.name)}`);
 
-  // Show key input details
   const preview = formatInputPreview(call);
   if (preview) {
     console.log(chalk.dim(preview));
   }
-  console.log(chalk.dim('─'.repeat(60)));
+  console.log(chalk.dim('-'.repeat(60)));
 
   const { approved } = await inquirer.prompt([
     {
@@ -127,7 +125,7 @@ function formatInputPreview(call: ToolCall): string {
     case 'edit_file':
     case 'delete_file':
     case 'read_file':
-      return `  📄 ${chalk.cyan(call.input.path as string)}`;
+      return `  file ${chalk.cyan(call.input.path as string)}`;
     default:
       return '';
   }
@@ -136,32 +134,42 @@ function formatInputPreview(call: ToolCall): string {
 export class SessionLogger {
   private logPath: string;
   private sessionId: string;
+  private enabled: boolean;
 
-  constructor(sessionId: string) {
+  constructor(sessionId: string, enabled = true) {
     this.sessionId = sessionId;
+    this.enabled = enabled;
     const logDir = join(homedir(), '.trident', 'logs');
     this.logPath = join(logDir, `${sessionId}.jsonl`);
 
-    // Create log dir synchronously so it exists before the first log() call
+    if (!this.enabled) {
+      return;
+    }
+
     if (!existsSync(logDir)) {
       try {
         mkdirSync(logDir, { recursive: true });
       } catch {
-        // Non-fatal: logging will silently fail if mkdir fails
+        // Logging is non-fatal.
       }
     }
   }
 
   async log(entry: Omit<ActionLog, 'timestamp' | 'sessionId'>): Promise<void> {
+    if (!this.enabled) {
+      return;
+    }
+
     const full: ActionLog = {
       ...entry,
       timestamp: new Date().toISOString(),
       sessionId: this.sessionId,
     };
+
     try {
       await appendFile(this.logPath, JSON.stringify(full) + '\n', 'utf-8');
     } catch {
-      // Logging failure is non-fatal
+      // Logging is non-fatal.
     }
   }
 }

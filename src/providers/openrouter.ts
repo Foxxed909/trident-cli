@@ -7,6 +7,7 @@ import type { ChatMessage, StreamChunk } from './anthropic.js';
 export const OPENROUTER_MODELS = {
   // Anthropic via OpenRouter
   'anthropic/claude-opus-4-5': { input: 15, output: 75 },
+  'anthropic/claude-sonnet-4-6': { input: 3, output: 15 },
   'anthropic/claude-sonnet-4-5': { input: 3, output: 15 },
   // OpenAI
   'openai/gpt-4o': { input: 5, output: 15 },
@@ -127,6 +128,7 @@ export async function* streamOpenRouter(
     messages: openAIMessages,
     tools: openAITools,
     tool_choice: 'auto',
+    stream_options: { include_usage: true },
     stream: true,
   };
 
@@ -160,6 +162,7 @@ export async function* streamOpenRouter(
   }> = {};
 
   let receivedDone = false;
+  let latestUsage: { inputTokens: number; outputTokens: number } | null = null;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -174,13 +177,16 @@ export async function* streamOpenRouter(
       const data = line.slice(6).trim();
       if (data === '[DONE]') {
         receivedDone = true;
+        if (latestUsage) {
+          yield { type: 'usage', usage: latestUsage };
+        }
         // Flush any accumulated tool calls
         for (const tc of Object.values(toolCallAccumulators)) {
           try {
             const input = JSON.parse(tc.arguments || '{}');
             yield {
               type: 'tool_call',
-              toolCall: { id: tc.id, name: tc.name as ToolCall['name'], input },
+              toolCall: { id: tc.id || `tool_${Date.now()}`, name: tc.name as ToolCall['name'], input },
             };
           } catch {
             // Malformed tool args
@@ -215,12 +221,9 @@ export async function* streamOpenRouter(
 
         // Usage stats
         if (chunk.usage) {
-          yield {
-            type: 'usage',
-            usage: {
-              inputTokens: chunk.usage.prompt_tokens || 0,
-              outputTokens: chunk.usage.completion_tokens || 0,
-            },
+          latestUsage = {
+            inputTokens: chunk.usage.prompt_tokens || 0,
+            outputTokens: chunk.usage.completion_tokens || 0,
           };
         }
       } catch {
@@ -231,12 +234,15 @@ export async function* streamOpenRouter(
 
   // Stream ended without a [DONE] line — flush any buffered tool calls and signal an error
   if (!receivedDone) {
+    if (latestUsage) {
+      yield { type: 'usage', usage: latestUsage };
+    }
     for (const tc of Object.values(toolCallAccumulators)) {
       try {
         const input = JSON.parse(tc.arguments || '{}');
         yield {
           type: 'tool_call',
-          toolCall: { id: tc.id, name: tc.name as ToolCall['name'], input },
+          toolCall: { id: tc.id || `tool_${Date.now()}`, name: tc.name as ToolCall['name'], input },
         };
       } catch {
         // Malformed tool args

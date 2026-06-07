@@ -1,6 +1,6 @@
 import { readFile, writeFile, unlink, readdir, lstat } from 'fs/promises';
 import { existsSync } from 'fs';
-import { join, resolve, relative } from 'path';
+import { join, resolve, relative, isAbsolute } from 'path';
 import { execa } from 'execa';
 import fg from 'fast-glob';
 
@@ -45,7 +45,7 @@ export async function executeTool(
   try {
     switch (call.name) {
       case 'read_file': {
-        const filePath = resolve(cwd, call.input.path as string);
+        const filePath = resolveWorkspacePath(cwd, call.input.path as string);
         if (!existsSync(filePath)) {
           return { success: false, output: '', error: `File not found: ${filePath}`, duration_ms: Date.now() - start };
         }
@@ -55,7 +55,7 @@ export async function executeTool(
 
       case 'write_file': {
         const { path: filePath, content } = call.input as { path: string; content: string };
-        const absPath = resolve(cwd, filePath);
+        const absPath = resolveWorkspacePath(cwd, filePath);
         const { mkdirSync } = await import('fs');
         const { dirname } = await import('path');
         mkdirSync(dirname(absPath), { recursive: true });
@@ -65,7 +65,7 @@ export async function executeTool(
 
       case 'edit_file': {
         const { path: filePath, edits } = call.input as { path: string; edits: EditOperation[] };
-        const absPath = resolve(cwd, filePath);
+        const absPath = resolveWorkspacePath(cwd, filePath);
         if (!existsSync(absPath)) {
           return { success: false, output: '', error: `File not found: ${absPath}`, duration_ms: Date.now() - start };
         }
@@ -89,7 +89,7 @@ export async function executeTool(
       }
 
       case 'delete_file': {
-        const absPath = resolve(cwd, call.input.path as string);
+        const absPath = resolveWorkspacePath(cwd, call.input.path as string);
         if (!existsSync(absPath)) {
           return { success: false, output: '', error: `File not found: ${absPath}`, duration_ms: Date.now() - start };
         }
@@ -103,7 +103,7 @@ export async function executeTool(
 
       case 'list_dir': {
         const { path: dirPath, recursive = false } = call.input as { path: string; recursive?: boolean };
-        const absPath = resolve(cwd, dirPath);
+        const absPath = resolveWorkspacePath(cwd, dirPath);
 
         if (recursive) {
           const normalizedPath = absPath.replace(/\\/g, '/');
@@ -123,7 +123,7 @@ export async function executeTool(
 
       case 'run_command': {
         const { cmd, cwd: cmdCwd } = call.input as { cmd: string; cwd?: string };
-        const execCwd = cmdCwd ? resolve(cwd, cmdCwd) : cwd;
+        const execCwd = cmdCwd ? resolveWorkspacePath(cwd, cmdCwd) : cwd;
         const isWindows = process.platform === 'win32';
         const shellExe = isWindows ? 'cmd' : 'bash';
         const shellFlag = isWindows ? '/c' : '-c';
@@ -264,6 +264,22 @@ export async function executeTool(
       duration_ms: Date.now() - start,
     };
   }
+}
+
+export function resolveWorkspacePath(workspaceRoot: string, targetPath: string): string {
+  const resolvedRoot = resolve(workspaceRoot);
+  const resolvedPath = resolve(workspaceRoot, targetPath);
+  const relativePath = relative(resolvedRoot, resolvedPath);
+
+  if (relativePath === '') {
+    return resolvedPath;
+  }
+
+  if (relativePath.startsWith('..') || isAbsolute(relativePath)) {
+    throw new Error(`Path escapes workspace root: ${targetPath}`);
+  }
+
+  return resolvedPath;
 }
 
 export const TOOL_DEFINITIONS = [
