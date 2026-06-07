@@ -92,7 +92,10 @@ export async function requestApproval(
 
 async function promptUser(call: ToolCall, risk: RiskLevel): Promise<boolean> {
   if (!process.stdin.isTTY) {
-    return risk !== 'destructive';
+    const decision = risk !== 'destructive';
+    const label = decision ? chalk.yellow('auto-approved') : chalk.red('auto-rejected');
+    console.warn(`  [WARDEN] non-TTY: ${label} ${getRiskColor(risk)} ${chalk.bold(call.name)}`);
+    return decision;
   }
 
   console.log('');

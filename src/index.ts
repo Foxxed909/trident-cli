@@ -35,6 +35,7 @@ import {
   printWelcome,
   printSlashHelp,
   printStatus,
+  printCostUpdate,
 } from './ui/renderer.js';
 
 const program = new Command();
@@ -484,6 +485,9 @@ async function showCommandPicker(
     {
       label: 'Project',
       entries: [
+        { cmd: '/search', desc: 'quick codebase keyword search' },
+        { cmd: '/git', desc: 'run a git command (default: status)' },
+        { cmd: '/diff', desc: 'show git diff (optional: file path)' },
         { cmd: '/init', desc: 'generate TRIDENT.md' },
         { cmd: '/context', desc: 'show TRIDENT.md contents' },
         { cmd: '/tree', desc: 'show project file tree' },
@@ -1035,6 +1039,100 @@ async function runTrident(
         return true;
       }
 
+      case 'git': {
+        const gitCmd = arg || 'status';
+        const isWindows = process.platform === 'win32';
+        const shellExe = isWindows ? 'cmd' : 'bash';
+        const shellFlag = isWindows ? '/c' : '-c';
+        try {
+          const execRes = await execa(shellExe, [shellFlag, `git ${gitCmd}`], { cwd, reject: false, all: true });
+          const out = (typeof execRes.all === 'string' ? execRes.all : '').trim();
+          if (out) {
+            console.log('');
+            for (const line of out.split('\n')) {
+              const colored = line.startsWith('+') ? chalk.green(line)
+                : line.startsWith('-') ? chalk.red(line)
+                : line.startsWith('@@') ? chalk.cyan(line)
+                : chalk.hex('#94A3B8')(line);
+              console.log('  ' + colored);
+            }
+            console.log('');
+          } else {
+            printInfo('(no output)');
+          }
+        } catch (err) {
+          printError(`git ${gitCmd}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        return true;
+      }
+
+      case 'search': {
+        if (!arg) {
+          printError('Usage: /search <query> [glob]');
+          return true;
+        }
+        const [searchQuery, searchGlob] = arg.split(/\s+(?=\*|\*\*|[a-zA-Z0-9_-]+[/*])/, 2);
+        printInfo(`Searching for "${searchQuery}"...`);
+        const { executeTool: execTool } = await import('./agent/tools.js');
+        const searchResult = await execTool(
+          { name: 'search_codebase', input: { query: searchQuery, ...(searchGlob ? { glob: searchGlob } : {}) } },
+          cwd,
+          async () => '',
+        );
+        if (!searchResult.success) {
+          printError(searchResult.error || 'Search failed');
+          return true;
+        }
+        console.log('');
+        for (const line of searchResult.output.split('\n')) {
+          const isFilePath = !line.startsWith(' ') && !line.startsWith('Found') && !line.startsWith('[') && line.trim().length > 0;
+          console.log('  ' + (isFilePath ? chalk.hex('#5EEAD4')(line) : chalk.hex('#94A3B8')(line)));
+        }
+        console.log('');
+        return true;
+      }
+
+      case 'diff': {
+        const diffTarget = arg ? `-- ${arg}` : '';
+        const isWindows = process.platform === 'win32';
+        const shellExe = isWindows ? 'cmd' : 'bash';
+        const shellFlag = isWindows ? '/c' : '-c';
+        try {
+          const execRes = await execa(shellExe, [shellFlag, `git diff ${diffTarget}`], { cwd, reject: false, all: true });
+          const out = (typeof execRes.all === 'string' ? execRes.all : '').trim();
+          if (!out) {
+            const stagedRes = await execa(shellExe, [shellFlag, `git diff --cached ${diffTarget}`], { cwd, reject: false, all: true });
+            const staged = (typeof stagedRes.all === 'string' ? stagedRes.all : '').trim();
+            if (!staged) {
+              printInfo(arg ? `No changes in ${arg}` : 'No uncommitted changes.');
+              return true;
+            }
+            console.log('');
+            printInfo('Staged changes:');
+            for (const line of staged.split('\n').slice(0, 200)) {
+              const colored = line.startsWith('+') ? chalk.green(line)
+                : line.startsWith('-') ? chalk.red(line)
+                : line.startsWith('@@') ? chalk.cyan(line)
+                : chalk.dim(line);
+              console.log('  ' + colored);
+            }
+          } else {
+            console.log('');
+            for (const line of out.split('\n').slice(0, 200)) {
+              const colored = line.startsWith('+') ? chalk.green(line)
+                : line.startsWith('-') ? chalk.red(line)
+                : line.startsWith('@@') ? chalk.cyan(line)
+                : chalk.dim(line);
+              console.log('  ' + colored);
+            }
+          }
+          console.log('');
+        } catch (err) {
+          printError(`diff failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        return true;
+      }
+
       default:
         printWarn(`Unknown command: /${head}. Type / then Enter for the menu, or /help for the list.`);
         return true;
@@ -1212,7 +1310,7 @@ async function executeTask(
       onToolStart,
       beforeToolExecute,
       onToolEnd: printToolEnd,
-      onCostUpdate: () => {},
+      onCostUpdate: printCostUpdate,
       askUserFn: opts.askUserFn,
     });
 

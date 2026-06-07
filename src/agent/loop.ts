@@ -48,6 +48,7 @@ export async function runAgentLoop(
   let finalSummary = 'Task completed.';
   let finalAnswerFound = false;
   let budgetExceeded = false;
+  let warnedMaxTurns = false;
   const isOpenRouter = opts.provider === 'openrouter';
 
   while (turns < opts.maxTurns) {
@@ -127,6 +128,11 @@ export async function runAgentLoop(
     }
 
     messages.push({ role: 'assistant', content: assistantContent });
+
+    if (!warnedMaxTurns && turns >= Math.floor(opts.maxTurns * 0.8)) {
+      console.log(chalk.yellow(`\n  [TRIDENT] Approaching turn limit (${turns}/${opts.maxTurns}). Use /compact or increase --max-turns if needed.`));
+      warnedMaxTurns = true;
+    }
 
     const runningCost = isOpenRouter
       ? calculateOpenRouterCost(opts.model, totalInputTokens, totalOutputTokens)
@@ -246,11 +252,17 @@ async function showDiffPreview(call: ToolCall, cwd: string): Promise<void> {
     }
 
     let newContent = originalContent;
+    let skippedEdits = 0;
     for (const edit of edits) {
       const idx = newContent.indexOf(edit.old_str);
       if (idx !== -1) {
         newContent = newContent.slice(0, idx) + edit.new_str + newContent.slice(idx + edit.old_str.length);
+      } else {
+        skippedEdits++;
       }
+    }
+    if (skippedEdits > 0) {
+      console.log(chalk.yellow(`  [preview] ${skippedEdits} edit(s) could not be previewed (old_str not found) — will error on execution.`));
     }
 
     if (newContent !== originalContent) {

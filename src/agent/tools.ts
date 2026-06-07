@@ -70,7 +70,6 @@ export async function executeTool(
           return { success: false, output: '', error: `File not found: ${absPath}`, duration_ms: Date.now() - start };
         }
         let content = await readFile(absPath, 'utf-8');
-        const warnings: string[] = [];
         for (const edit of edits) {
           const idx = content.indexOf(edit.old_str);
           if (idx === -1) {
@@ -78,14 +77,17 @@ export async function executeTool(
           }
           const occurrences = content.split(edit.old_str).length - 1;
           if (occurrences > 1) {
-            warnings.push(`Warning: old_str appeared ${occurrences} times — only the first occurrence was replaced.`);
+            return {
+              success: false,
+              output: '',
+              error: `Ambiguous edit: old_str appears ${occurrences} times in ${relative(cwd, absPath)}. Make old_str more specific by including more surrounding context.`,
+              duration_ms: Date.now() - start,
+            };
           }
-          // Use split/join to avoid replace's $& / $1 substitution semantics
           content = content.slice(0, idx) + edit.new_str + content.slice(idx + edit.old_str.length);
         }
         await writeFile(absPath, content, 'utf-8');
-        const baseOutput = `Edited: ${relative(cwd, absPath)} (${edits.length} edit(s))`;
-        return { success: true, output: warnings.length > 0 ? `${baseOutput}\n${warnings.join('\n')}` : baseOutput, duration_ms: Date.now() - start };
+        return { success: true, output: `Edited: ${relative(cwd, absPath)} (${edits.length} edit(s))`, duration_ms: Date.now() - start };
       }
 
       case 'delete_file': {
@@ -111,6 +113,7 @@ export async function executeTool(
           const files = await fg(pattern, {
             ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/.next/**'],
             dot: false,
+            followSymbolicLinks: false,
           });
           const relFiles = files.map((f) => relative(cwd, f)).sort();
           return { success: true, output: relFiles.join('\n'), duration_ms: Date.now() - start };
@@ -238,7 +241,12 @@ export async function executeTool(
         if (!resp.ok) {
           return { success: false, output: '', error: `HTTP ${resp.status} ${resp.statusText}`, duration_ms: Date.now() - start };
         }
-        const text = await resp.text();
+        let text: string;
+        try {
+          text = await resp.text();
+        } catch (e) {
+          return { success: false, output: '', error: `Failed to read response body: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start };
+        }
         return { success: true, output: text.slice(0, 16000), duration_ms: Date.now() - start };
       }
 

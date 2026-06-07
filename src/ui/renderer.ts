@@ -279,6 +279,9 @@ export function printSlashHelp(): void {
     {
       label: 'Project',
       cmds: [
+        ['/search <query>', 'quick codebase keyword search (no agent needed)'],
+        ['/git [args]', 'run a git command in the project root (default: status)'],
+        ['/diff [file]', 'show git diff for working tree or a specific file'],
         ['/init', 'generate TRIDENT.md for the current project'],
         ['/context', 'show current TRIDENT.md contents'],
         ['/tree', 'show project file tree'],
