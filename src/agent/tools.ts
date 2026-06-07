@@ -276,73 +276,101 @@ export async function executeTool(
       }
 
       case 'git_blame': {
-        const { path: filePath, line } = call.input as { path: string; line?: number };
+        const { path: filePath, startLine, endLine } = call.input as { path: string; startLine?: number; endLine?: number };
         const absPath = resolveWorkspacePath(cwd, filePath);
-        const isWin = process.platform === 'win32';
-        const lineFlag = line ? `-L ${line},${line}` : '';
-        const res = await execa(isWin ? 'cmd' : 'bash', [isWin ? '/c' : '-c', `git blame ${lineFlag} -- "${absPath}"`], {
-          cwd, reject: false, all: true, timeout: 15000,
-        });
-        const out = typeof res.all === 'string' ? res.all : '';
-        if (res.exitCode !== 0) {
-          return { success: false, output: out, error: `git blame failed (exit ${res.exitCode})`, duration_ms: Date.now() - start };
+        if (!existsSync(absPath)) return { success: false, output: '', error: `File not found: ${absPath}`, duration_ms: Date.now() - start };
+        const lineFlag = (startLine && endLine) ? ` -L ${startLine},${endLine}` : '';
+        const isWindows = process.platform === 'win32';
+        const execRes = await execa(isWindows ? 'cmd' : 'bash', [isWindows ? '/c' : '-c', `git blame --porcelain${lineFlag} -- "${filePath}"`], { cwd, reject: false, all: true, timeout: 10000 });
+        const blameOut = typeof execRes.all === 'string' ? execRes.all : '';
+        if (execRes.exitCode !== 0) return { success: false, output: '', error: blameOut.slice(0, 500) || 'git blame failed', duration_ms: Date.now() - start };
+        const blameLines = blameOut.split('\n');
+        const blameResult: string[] = [];
+        let currentCommit = '';
+        let currentAuthor = '';
+        let currentTime = '';
+        let lineNum = 0;
+        for (const line of blameLines) {
+          if (/^[0-9a-f]{40}/.test(line)) {
+            currentCommit = line.slice(0, 8);
+          } else if (line.startsWith('author ')) {
+            currentAuthor = line.slice(7);
+          } else if (line.startsWith('author-time ')) {
+            currentTime = new Date(parseInt(line.slice(12)) * 1000).toISOString().slice(0, 10);
+          } else if (line.startsWith('\t')) {
+            lineNum++;
+            blameResult.push(`${String(lineNum).padStart(4)}  ${currentCommit}  ${currentAuthor.slice(0, 15).padEnd(15)}  ${currentTime}  ${line.slice(1)}`);
+          }
         }
-        return { success: true, output: out.slice(0, 8000), duration_ms: Date.now() - start };
+        return { success: true, output: blameResult.join('\n').slice(0, 12000), duration_ms: Date.now() - start };
       }
 
       case 'web_search': {
-        const { query } = call.input as { query: string };
-        let html: string;
+        const { query, maxResults = 8 } = call.input as { query: string; maxResults?: number };
+        let searchResp: Response;
         try {
-          const resp = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
+          searchResp = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
             signal: AbortSignal.timeout(15000),
-            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TRIDENT/1.0)' },
+            headers: { 'User-Agent': 'Mozilla/5.0 TRIDENT-CLI/1.0' },
           });
-          html = await resp.text();
         } catch (e) {
-          return { success: false, output: '', error: `Search request failed: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start };
+          return { success: false, output: '', error: `Search failed: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start };
         }
-        // Extract result snippets from DuckDuckGo HTML
-        const snippets: string[] = [];
-        const titleRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]*>([^<]+)<\/a>/g;
-        const snippetRe = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([^<]+)<\/a>/g;
-        const titleMatches = [...html.matchAll(titleRe)].slice(0, 8);
-        const snippetMatches = [...html.matchAll(snippetRe)].slice(0, 8);
-        for (let i = 0; i < Math.min(titleMatches.length, 8); i++) {
-          const title = titleMatches[i]?.[1]?.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim() || '';
-          const snippet = snippetMatches[i]?.[1]?.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim() || '';
-          if (title) snippets.push(`${i + 1}. ${title}${snippet ? '\n   ' + snippet : ''}`);
+        let html: string;
+        try { html = await searchResp.text(); } catch (e) { return { success: false, output: '', error: `Failed to read response: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start }; }
+        const results: string[] = [];
+        const resultRegex = /<a class="result__a"[^>]*href="([^"]*)"[^>]*>([^<]*)<\/a>[\s\S]*?<a class="result__snippet"[^>]*>([^<]*)<\/a>/g;
+        let rMatch;
+        let count = 0;
+        while ((rMatch = resultRegex.exec(html)) !== null && count < (maxResults as number)) {
+          const [, href, title, snippet] = rMatch;
+          results.push(`${count + 1}. ${title.trim()}\n   URL: ${href}\n   ${snippet.trim()}`);
+          count++;
         }
-        if (snippets.length === 0) {
-          return { success: true, output: `No results found for "${query}"`, duration_ms: Date.now() - start };
+        if (results.length === 0) {
+          const titleRe = /<a[^>]+class="result__a"[^>]*>([^<]+)<\/a>/g;
+          const snippetRe = /<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+          const titles: string[] = [];
+          const snippets: string[] = [];
+          let m;
+          while ((m = titleRe.exec(html)) !== null) titles.push(m[1].trim());
+          while ((m = snippetRe.exec(html)) !== null) snippets.push(m[1].replace(/<[^>]+>/g, '').trim());
+          for (let i = 0; i < Math.min(titles.length, maxResults as number); i++) {
+            results.push(`${i + 1}. ${titles[i]}\n   ${snippets[i] || ''}`);
+          }
         }
-        return { success: true, output: `Search results for "${query}":\n\n${snippets.join('\n\n')}`, duration_ms: Date.now() - start };
+        if (results.length === 0) {
+          return { success: true, output: `No results found for: ${query}`, duration_ms: Date.now() - start };
+        }
+        return { success: true, output: `Search results for: ${query}\n\n${results.join('\n\n')}`, duration_ms: Date.now() - start };
       }
 
       case 'github_api': {
-        const { endpoint, method = 'GET', body } = call.input as { endpoint: string; method?: string; body?: Record<string, unknown> };
+        const { method = 'GET', path: apiPath, endpoint, body } = call.input as { method?: string; path?: string; endpoint?: string; body?: Record<string, unknown> };
+        const apiEndpoint = apiPath || endpoint || '';
         const token = process.env.GITHUB_TOKEN;
-        const headers: Record<string, string> = {
-          'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': 'TRIDENT-CLI/1.0',
-        };
-        if (token) headers['Authorization'] = `Bearer ${token}`;
-        const url = endpoint.startsWith('http') ? endpoint : `https://api.github.com${endpoint.startsWith('/') ? '' : '/'}${endpoint}`;
+        if (!token) return { success: false, output: '', error: 'GITHUB_TOKEN env var not set', duration_ms: Date.now() - start };
+        const url = apiEndpoint.startsWith('http') ? apiEndpoint : `https://api.github.com${apiEndpoint.startsWith('/') ? '' : '/'}${apiEndpoint}`;
         let resp: Response;
         try {
           resp = await fetch(url, {
             method,
-            headers,
-            body: body ? JSON.stringify(body) : undefined,
-            signal: AbortSignal.timeout(20000),
+            signal: AbortSignal.timeout(TIMEOUT_MS),
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+              'User-Agent': 'TRIDENT-CLI/1.0',
+              ...(body ? { 'Content-Type': 'application/json' } : {}),
+            },
+            ...(body ? { body: JSON.stringify(body) } : {}),
           });
         } catch (e) {
           return { success: false, output: '', error: `GitHub API request failed: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start };
         }
-        const text = await resp.text();
-        if (!resp.ok) {
-          return { success: false, output: text.slice(0, 2000), error: `GitHub API HTTP ${resp.status}`, duration_ms: Date.now() - start };
-        }
+        let text: string;
+        try { text = await resp.text(); } catch (e) { return { success: false, output: '', error: `Failed to read response: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start }; }
+        if (!resp.ok) return { success: false, output: text.slice(0, 2000), error: `GitHub API error: HTTP ${resp.status}`, duration_ms: Date.now() - start };
         return { success: true, output: text.slice(0, 16000), duration_ms: Date.now() - start };
       }
 
@@ -493,7 +521,7 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory_update',
-    description: 'Persist a fact or note to long-term agent memory. Use this to remember important project details, user preferences, or decisions across sessions.',
+    description: 'Persist a fact or note to long-term agent memory across sessions.',
     input_schema: {
       type: 'object',
       properties: { fact: { type: 'string', description: 'The fact or note to remember' } },
@@ -502,36 +530,40 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: 'git_blame',
-    description: 'Show git blame for a file to see who last modified each line',
+    description: 'Show who last modified each line of a file (git blame)',
     input_schema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Path to the file' },
-        line: { type: 'number', description: 'Optional specific line number to blame' },
+        startLine: { type: 'number', description: 'Optional start line' },
+        endLine: { type: 'number', description: 'Optional end line' },
       },
       required: ['path'],
     },
   },
   {
     name: 'web_search',
-    description: 'Search the web using DuckDuckGo and return top results',
+    description: 'Search the web using DuckDuckGo and return result titles, URLs, and snippets',
     input_schema: {
       type: 'object',
-      properties: { query: { type: 'string', description: 'Search query' } },
+      properties: {
+        query: { type: 'string', description: 'Search query' },
+        maxResults: { type: 'number', description: 'Max results to return (default 8)' },
+      },
       required: ['query'],
     },
   },
   {
     name: 'github_api',
-    description: 'Call the GitHub REST API. Requires GITHUB_TOKEN env var for authenticated requests.',
+    description: 'Call the GitHub REST API (requires GITHUB_TOKEN env var). Use for reading issues, PRs, creating PRs, etc.',
     input_schema: {
       type: 'object',
       properties: {
-        endpoint: { type: 'string', description: 'GitHub API endpoint path (e.g. /repos/owner/repo/issues) or full URL' },
         method: { type: 'string', description: 'HTTP method: GET, POST, PATCH, DELETE (default: GET)' },
-        body: { type: 'object', description: 'Optional JSON request body for POST/PATCH' },
+        path: { type: 'string', description: 'API path e.g. /repos/owner/repo/issues or full URL' },
+        body: { type: 'object', description: 'Request body for POST/PATCH' },
       },
-      required: ['endpoint'],
+      required: ['path'],
     },
   },
 ];

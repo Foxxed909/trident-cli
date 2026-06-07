@@ -28,6 +28,9 @@ export interface ProviderOptions {
   maxTokens: number;
   systemPrompt: string;
   tools: unknown[];
+  thinking?: boolean;
+  thinkingBudget?: number;
+  signal?: AbortSignal;
 }
 
 let _client: Anthropic | null = null;
@@ -42,13 +45,18 @@ export async function* streamCompletion(
   messages: ChatMessage[],
   opts: ProviderOptions
 ): AsyncGenerator<StreamChunk> {
-  const stream = getClient().messages.stream({
+  const params: Record<string, unknown> = {
     model: opts.model,
     max_tokens: opts.maxTokens,
     system: opts.systemPrompt,
     tools: opts.tools as Anthropic.Tool[],
     messages: messages as Anthropic.MessageParam[],
-  });
+  };
+  if (opts.thinking) {
+    params.thinking = { type: 'enabled', budget_tokens: opts.thinkingBudget ?? 10000 };
+    params.betas = ['interleaved-thinking-2025-05-14'];
+  }
+  const stream = getClient().messages.stream(params as unknown as Anthropic.MessageStreamParams);
 
   let currentToolId: string | null = null;
   let currentToolName: string | null = null;
@@ -57,6 +65,10 @@ export async function* streamCompletion(
   let outputTokens = 0;
 
   for await (const event of stream) {
+    if (opts.signal?.aborted) {
+      stream.abort();
+      return;
+    }
     if (event.type === 'content_block_start') {
       if (event.content_block.type === 'tool_use') {
         currentToolId = event.content_block.id;
@@ -110,4 +122,14 @@ const PRICING: Record<string, { input: number; output: number }> = {
 export function calculateCost(model: string, inputTokens: number, outputTokens: number): number {
   const pricing = PRICING[model] || { input: 0, output: 0 };
   return (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
+}
+
+export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
+  'claude-opus-4-7': 200000, 'claude-opus-4-5': 200000,
+  'claude-sonnet-4-6': 200000, 'claude-sonnet-4-5': 200000,
+  'claude-haiku-4-5-20251001': 200000,
+};
+
+export function getContextLimit(model: string): number {
+  return MODEL_CONTEXT_LIMITS[model] ?? 200000;
 }
