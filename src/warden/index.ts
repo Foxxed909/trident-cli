@@ -1,9 +1,10 @@
 import chalk from 'chalk';
 import inquirer from 'inquirer';
-import { appendFile } from 'fs/promises';
+import { appendFile, readFile } from 'fs/promises';
 import { existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { execa } from 'execa';
 import type { ToolCall } from '../agent/tools.js';
 
 export type ApprovalMode = 'yolo' | 'review' | 'lockdown';
@@ -175,4 +176,28 @@ export class SessionLogger {
       // Logging is non-fatal.
     }
   }
+}
+
+export interface HooksConfig {
+  before_tool?: Record<string, string>; // toolName -> shell command
+  after_tool?: Record<string, string>;  // toolName -> shell command
+  on_task_start?: string;  // shell command run at start of each task
+  on_task_end?: string;    // shell command run at end of each task
+}
+
+export async function loadHooks(cwd: string): Promise<HooksConfig> {
+  const hooksPath = join(cwd, '.trident', 'hooks.json');
+  if (!existsSync(hooksPath)) return {};
+  try {
+    const content = await readFile(hooksPath, 'utf-8');
+    return JSON.parse(content) as HooksConfig;
+  } catch { return {}; }
+}
+
+export async function runHook(cmd: string, cwd: string): Promise<void> {
+  if (!cmd) return;
+  const isWindows = process.platform === 'win32';
+  try {
+    await execa(isWindows ? 'cmd' : 'bash', [isWindows ? '/c' : '-c', cmd], { cwd, timeout: 10000, reject: false });
+  } catch {}
 }

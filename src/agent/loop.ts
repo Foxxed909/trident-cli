@@ -19,6 +19,9 @@ export interface AgentOptions {
   budgetUsd?: number;
   logSessions: boolean;
   sessionId: string;
+  thinking?: boolean;
+  thinkingBudget?: number;
+  abortSignal?: AbortSignal;
   onText?: (text: string) => void;
   onToolStart?: (call: ToolCall) => void | Promise<void>;
   beforeToolExecute?: (call: ToolCall) => void | Promise<void>;
@@ -56,6 +59,12 @@ export async function runAgentLoop(
   const turnCostHistory: Array<{ turn: number; cost: number }> = [];
 
   while (turns < opts.maxTurns) {
+    // Check for abort before each turn
+    if (opts.abortSignal?.aborted) {
+      finalSummary = 'Interrupted by user.';
+      break;
+    }
+
     turns++;
 
     // Start per-turn spinner; returns a stop function called on first output
@@ -93,9 +102,15 @@ export async function runAgentLoop(
               maxTokens: 8096,
               systemPrompt: opts.systemPrompt,
               tools: TOOL_DEFINITIONS,
+              thinking: opts.thinking,
+              thinkingBudget: opts.thinkingBudget,
+              signal: opts.abortSignal,
             });
 
         for await (const chunk of stream) {
+          if (opts.abortSignal?.aborted) {
+            break;
+          }
           if (chunk.type === 'text' && chunk.text) {
             stopSpin();
             assistantText += chunk.text;
@@ -127,6 +142,20 @@ export async function runAgentLoop(
       } catch (err) {
         stopSpin();
         const error = err instanceof Error ? err : new Error(String(err));
+        // If aborted, exit gracefully
+        if (opts.abortSignal?.aborted) {
+          finalSummary = 'Interrupted by user.';
+          return {
+            success: false,
+            summary: finalSummary,
+            turns,
+            totalCost: isOpenRouter
+              ? calculateOpenRouterCost(opts.model, totalInputTokens, totalOutputTokens)
+              : calculateCost(opts.model, totalInputTokens, totalOutputTokens),
+            totalTokens: { input: totalInputTokens, output: totalOutputTokens },
+            turnCosts: turnCostHistory,
+          };
+        }
         const isTransient = /ECONNRESET|ETIMEDOUT|rate.?limit|overloaded|503|529/i.test(error.message);
         if (!isTransient || streamAttempt >= 2) {
           throw error;
@@ -135,6 +164,12 @@ export async function runAgentLoop(
         console.log(chalk.yellow(`\n  retrying after API error (${error.message.slice(0, 60)}) ${streamAttempt}/2...`));
         await new Promise((r) => setTimeout(r, 1500 * streamAttempt));
       }
+    }
+
+    // If aborted mid-stream, exit
+    if (opts.abortSignal?.aborted) {
+      finalSummary = 'Interrupted by user.';
+      break;
     }
 
     const assistantContent: ChatMessage['content'] = [];

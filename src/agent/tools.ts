@@ -21,7 +21,11 @@ export type ToolName =
   | 'search_codebase'
   | 'web_fetch'
   | 'ask_user'
-  | 'final_answer';
+  | 'final_answer'
+  | 'git_blame'
+  | 'web_search'
+  | 'memory_update'
+  | 'github_api';
 
 export interface ToolCall {
   name: ToolName;
@@ -261,6 +265,115 @@ export async function executeTool(
         return { success: true, output: summary, duration_ms: Date.now() - start };
       }
 
+      case 'git_blame': {
+        const { path: filePath, startLine, endLine } = call.input as { path: string; startLine?: number; endLine?: number };
+        const absPath = resolveWorkspacePath(cwd, filePath);
+        if (!existsSync(absPath)) return { success: false, output: '', error: `File not found: ${absPath}`, duration_ms: Date.now() - start };
+        const lineFlag = (startLine && endLine) ? ` -L ${startLine},${endLine}` : '';
+        const isWindows = process.platform === 'win32';
+        const execRes = await execa(isWindows ? 'cmd' : 'bash', [isWindows ? '/c' : '-c', `git blame --porcelain${lineFlag} -- "${filePath}"`], { cwd, reject: false, all: true, timeout: 10000 });
+        const out = typeof execRes.all === 'string' ? execRes.all : '';
+        if (execRes.exitCode !== 0) return { success: false, output: '', error: out.slice(0, 500) || 'git blame failed', duration_ms: Date.now() - start };
+        // Parse porcelain format into readable output
+        const lines = out.split('\n');
+        const result: string[] = [];
+        let currentCommit = '';
+        let currentAuthor = '';
+        let currentTime = '';
+        let lineNum = 0;
+        for (const line of lines) {
+          if (/^[0-9a-f]{40}/.test(line)) {
+            currentCommit = line.slice(0, 8);
+          } else if (line.startsWith('author ')) {
+            currentAuthor = line.slice(7);
+          } else if (line.startsWith('author-time ')) {
+            currentTime = new Date(parseInt(line.slice(12)) * 1000).toISOString().slice(0, 10);
+          } else if (line.startsWith('\t')) {
+            lineNum++;
+            result.push(`${String(lineNum).padStart(4)}  ${currentCommit}  ${currentAuthor.slice(0,15).padEnd(15)}  ${currentTime}  ${line.slice(1)}`);
+          }
+        }
+        return { success: true, output: result.join('\n').slice(0, 12000), duration_ms: Date.now() - start };
+      }
+
+      case 'web_search': {
+        const { query, maxResults = 8 } = call.input as { query: string; maxResults?: number };
+        const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+        let resp: Response;
+        try {
+          resp = await fetch(url, { signal: AbortSignal.timeout(15000), headers: { 'User-Agent': 'Mozilla/5.0 TRIDENT-CLI/1.0' } });
+        } catch (e) {
+          return { success: false, output: '', error: `Search failed: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start };
+        }
+        let html: string;
+        try { html = await resp.text(); } catch (e) { return { success: false, output: '', error: `Failed to read response: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start }; }
+        // Parse results from DuckDuckGo HTML
+        const results: string[] = [];
+        const resultRegex = /<a class="result__a"[^>]*href="([^"]*)"[^>]*>([^<]*)<\/a>[\s\S]*?<a class="result__snippet"[^>]*>([^<]*)<\/a>/g;
+        let match;
+        let count = 0;
+        while ((match = resultRegex.exec(html)) !== null && count < (maxResults as number)) {
+          const [, href, title, snippet] = match;
+          results.push(`${count + 1}. ${title.trim()}\n   URL: ${href}\n   ${snippet.trim()}`);
+          count++;
+        }
+        // Fallback: simpler extraction
+        if (results.length === 0) {
+          const titleRe = /<a[^>]+class="result__a"[^>]*>([^<]+)<\/a>/g;
+          const snippetRe = /<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+          const titles: string[] = [];
+          const snippets: string[] = [];
+          let m;
+          while ((m = titleRe.exec(html)) !== null) titles.push(m[1].trim());
+          while ((m = snippetRe.exec(html)) !== null) snippets.push(m[1].replace(/<[^>]+>/g, '').trim());
+          for (let i = 0; i < Math.min(titles.length, maxResults as number); i++) {
+            results.push(`${i + 1}. ${titles[i]}\n   ${snippets[i] || ''}`);
+          }
+        }
+        if (results.length === 0) {
+          return { success: true, output: `No results found for: ${query}`, duration_ms: Date.now() - start };
+        }
+        return { success: true, output: `Search results for: ${query}\n\n${results.join('\n\n')}`, duration_ms: Date.now() - start };
+      }
+
+      case 'memory_update': {
+        const { fact } = call.input as { fact: string };
+        const { homedir } = await import('os');
+        const { appendFile: appendFileFs, mkdir } = await import('fs/promises');
+        const memDir = join(homedir(), '.trident');
+        const memPath = join(memDir, 'memory.md');
+        try {
+          await mkdir(memDir, { recursive: true });
+          const entry = `\n- [${new Date().toISOString().slice(0,10)}] ${fact.trim()}`;
+          await appendFileFs(memPath, entry, 'utf-8');
+        } catch (e) {
+          return { success: false, output: '', error: `Memory update failed: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start };
+        }
+        return { success: true, output: `Memory updated: ${fact.slice(0, 80)}`, duration_ms: Date.now() - start };
+      }
+
+      case 'github_api': {
+        const { method = 'GET', path: apiPath, body } = call.input as { method?: string; path: string; body?: Record<string, unknown> };
+        const token = process.env.GITHUB_TOKEN;
+        if (!token) return { success: false, output: '', error: 'GITHUB_TOKEN env var not set', duration_ms: Date.now() - start };
+        const url = apiPath.startsWith('http') ? apiPath : `https://api.github.com${apiPath}`;
+        let resp: Response;
+        try {
+          resp = await fetch(url, {
+            method,
+            signal: AbortSignal.timeout(TIMEOUT_MS),
+            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'TRIDENT-CLI/1.0', ...(body ? { 'Content-Type': 'application/json' } : {}) },
+            ...(body ? { body: JSON.stringify(body) } : {}),
+          });
+        } catch (e) {
+          return { success: false, output: '', error: `GitHub API request failed: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start };
+        }
+        let text: string;
+        try { text = await resp.text(); } catch (e) { return { success: false, output: '', error: `Failed to read response: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start }; }
+        if (!resp.ok) return { success: false, output: text.slice(0, 2000), error: `GitHub API error: HTTP ${resp.status}`, duration_ms: Date.now() - start };
+        return { success: true, output: text.slice(0, 16000), duration_ms: Date.now() - start };
+      }
+
       default:
         return { success: false, output: '', error: `Unknown tool: ${(call as ToolCall).name}`, duration_ms: Date.now() - start };
     }
@@ -404,6 +517,53 @@ export const TOOL_DEFINITIONS = [
       type: 'object',
       properties: { summary: { type: 'string', description: 'Summary of what was accomplished' } },
       required: ['summary'],
+    },
+  },
+  {
+    name: 'git_blame',
+    description: 'Show who last modified each line of a file (git blame)',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Path to the file' },
+        startLine: { type: 'number', description: 'Optional start line' },
+        endLine: { type: 'number', description: 'Optional end line' },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'web_search',
+    description: 'Search the web using DuckDuckGo and return result titles, URLs, and snippets',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search query' },
+        maxResults: { type: 'number', description: 'Max results to return (default 8)' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'memory_update',
+    description: 'Save an important fact or preference to persistent memory across sessions',
+    input_schema: {
+      type: 'object',
+      properties: { fact: { type: 'string', description: 'The fact or preference to remember' } },
+      required: ['fact'],
+    },
+  },
+  {
+    name: 'github_api',
+    description: 'Call the GitHub REST API (requires GITHUB_TOKEN env var). Use for reading issues, PRs, creating PRs, etc.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        method: { type: 'string', description: 'HTTP method: GET, POST, PATCH, DELETE (default: GET)' },
+        path: { type: 'string', description: 'API path e.g. /repos/owner/repo/issues or full URL' },
+        body: { type: 'object', description: 'Request body for POST/PATCH' },
+      },
+      required: ['path'],
     },
   },
 ];

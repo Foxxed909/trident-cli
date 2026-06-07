@@ -20,6 +20,7 @@ import { resolveWorkspacePath } from './agent/tools.js';
 import { listOpenRouterModels } from './providers/openrouter.js';
 import { codexSandboxForMode, isCodexCliAvailable, runCodexExec } from './providers/codex.js';
 import { formatProfileNames, listTrainedProfiles, resolveProfile, type TrainedProfile } from './profiles.js';
+import { loadHooks, runHook, type HooksConfig } from './warden/index.js';
 import {
   printLogo,
   printSessionHeader,
@@ -59,6 +60,7 @@ program
   .option('--system-override <text>', 'Operator system override appended to the agent prompt')
   .option('--codex-model <model>', 'Codex CLI model override (provider=codex only)')
   .option('--codex-timeout <ms>', 'Codex CLI timeout in milliseconds')
+  .option('--thinking', 'Enable extended thinking (Anthropic only)')
   .action(async (task?: string, opts?: {
     model?: string;
     provider?: string;
@@ -69,6 +71,7 @@ program
     systemOverride?: string;
     codexModel?: string;
     codexTimeout?: string;
+    thinking?: boolean;
   }) => {
     await runTrident(task, opts);
   });
@@ -416,7 +419,6 @@ program
       return;
     }
 
-    const latest = files[0];
     const loaded = await loadLatestReviewableSession(files);
     if (!loaded) {
       printError('No readable session logs found.');
@@ -535,6 +537,14 @@ interface UndoEntry {
   originalContent: string | null;
 }
 
+interface BackgroundTask {
+  id: number;
+  task: string;
+  status: 'running' | 'done' | 'failed';
+  summary?: string;
+  cost?: number;
+}
+
 async function showCommandPicker(
   rl: ReturnType<typeof createInterface>,
   handleSlash: (raw: string) => Promise<boolean>
@@ -567,6 +577,8 @@ async function showCommandPicker(
         { cmd: '/budget', desc: 'show, set, or clear session budget' },
         { cmd: '/profile', desc: 'show or switch trained profile' },
         { cmd: '/override', desc: 'show or set system override' },
+        { cmd: '/think', desc: 'toggle extended thinking on/off' },
+        { cmd: '/jobs', desc: 'list background tasks' },
       ],
     },
     {
@@ -640,6 +652,7 @@ async function runTrident(
     systemOverride?: string;
     codexModel?: string;
     codexTimeout?: string;
+    thinking?: boolean;
   }
 ): Promise<void> {
   let config: TridentConfig;
@@ -675,6 +688,9 @@ async function runTrident(
 
   printInfo('Loading project context...');
   const ctx = await loadOrCreateContext(cwd);
+
+  // Load hooks
+  const hooks: HooksConfig = await loadHooks(cwd);
 
   // Pinned files: path -> content, always injected into system prompt
   const pinnedFiles = new Map<string, string>();
@@ -745,6 +761,7 @@ async function runTrident(
   await ensureProviderReady(provider);
 
   if (initialTask) {
+    if (hooks.on_task_start) await runHook(hooks.on_task_start, cwd);
     await executeTask(initialTask, {
       model,
       mode,
@@ -757,7 +774,10 @@ async function runTrident(
       codexTimeoutMs,
       cwd,
       askUserFn,
+      thinking: cliOpts?.thinking ?? false,
+      hooks,
     });
+    if (hooks.on_task_end) await runHook(hooks.on_task_end, cwd);
     return;
   }
 
@@ -774,10 +794,12 @@ async function runTrident(
     tokens: { input: 0, output: 0 },
     turns: 0,
     budgetUsd: budgetUsd ?? config.budgetUsd,
+    thinking: cliOpts?.thinking ?? false,
   };
   const undoStack: UndoEntry[] = [];
   const taskHistory: Array<{ task: string; summary: string; cost: number }> = [];
   const turnCostLog: Array<{ taskIdx: number; turn: number; cost: number }> = [];
+  const backgroundTasks: BackgroundTask[] = [];
   let lastTask: string | null = null;
 
   const handleSlash = async (raw: string): Promise<boolean> => {
@@ -887,6 +909,8 @@ async function runTrident(
           cwd,
           askUserFn,
           undoStack,
+          thinking: session.thinking,
+          hooks,
         });
         if (result) {
           session.cost += result.totalCost;
@@ -1017,6 +1041,40 @@ async function runTrident(
         systemOverride = arg;
         session.systemOverride = arg;
         printSuccess('System override updated.');
+        return true;
+      }
+
+      case 'think': {
+        if (!arg || arg === 'on') {
+          session.thinking = true;
+          printSuccess('Extended thinking enabled.');
+        } else if (arg === 'off') {
+          session.thinking = false;
+          printSuccess('Extended thinking disabled.');
+        } else {
+          printError('Usage: /think [on|off]');
+        }
+        return true;
+      }
+
+      case 'jobs': {
+        if (backgroundTasks.length === 0) {
+          printInfo('No background tasks.');
+          return true;
+        }
+        console.log('');
+        console.log('  ' + chalk.hex('#5EEAD4').bold('Background tasks'));
+        for (const bg of backgroundTasks) {
+          const statusColor = bg.status === 'done' ? chalk.green(bg.status)
+            : bg.status === 'failed' ? chalk.red(bg.status)
+            : chalk.yellow(bg.status);
+          const costStr = bg.cost !== undefined ? chalk.dim(` $${bg.cost.toFixed(4)}`) : '';
+          console.log(`  ${chalk.dim(`#${bg.id}`)}  ${statusColor}  ${chalk.white(bg.task.slice(0, 60))}${costStr}`);
+          if (bg.summary) {
+            console.log(`         ${chalk.hex('#94A3B8')(bg.summary.slice(0, 80))}`);
+          }
+        }
+        console.log('');
         return true;
       }
 
@@ -1508,6 +1566,39 @@ async function runTrident(
       return;
     }
 
+    // Background task shortcut: bg:<task> or /bg <task>
+    if (task.startsWith('bg:') || task.startsWith('/bg ')) {
+      const bgTask = task.replace(/^(bg:|\/bg\s+)/, '').trim();
+      if (!bgTask) { printError('Usage: bg:<task> or /bg <task>'); return; }
+      const bgId = backgroundTasks.length + 1;
+      backgroundTasks.push({ id: bgId, task: bgTask, status: 'running' });
+      printInfo(`[bg#${bgId}] started in background: ${bgTask.slice(0, 60)}`);
+      executeTask(bgTask, {
+        model: session.model,
+        mode: session.mode,
+        provider: session.provider,
+        maxTurns,
+        budgetUsd: remainingBudget(session),
+        logSessions: config.logSessions,
+        systemPrompt: getSystemPrompt(),
+        profile: activeProfile,
+        codexTimeoutMs,
+        cwd,
+        askUserFn,
+        thinking: session.thinking,
+        hooks,
+      }).then(result => {
+        const bg = backgroundTasks.find(b => b.id === bgId);
+        if (bg) { bg.status = result ? 'done' : 'failed'; bg.summary = result?.summary; bg.cost = result?.totalCost; }
+        process.stdout.write(`\n  [bg#${bgId}] ${result ? 'DONE' : 'FAILED'}: ${bgTask.slice(0, 50)}\n`);
+        if (process.stdout.isTTY) printPrompt();
+      }).catch(() => {
+        const bg = backgroundTasks.find(b => b.id === bgId);
+        if (bg) bg.status = 'failed';
+      });
+      return; // Do NOT await - continue to REPL immediately
+    }
+
     if (task.startsWith('/')) {
       await handleSlash(task);
       return;
@@ -1534,6 +1625,8 @@ async function runTrident(
       return;
     }
 
+    if (hooks.on_task_start) await runHook(hooks.on_task_start, cwd);
+
     const taskIdx = taskHistory.length;
     const result = await executeTask(task, {
       model: session.model,
@@ -1548,7 +1641,11 @@ async function runTrident(
       cwd,
       askUserFn,
       undoStack,
+      thinking: session.thinking,
+      hooks,
     });
+
+    if (hooks.on_task_end) await runHook(hooks.on_task_end, cwd);
 
     if (result) {
       session.cost += result.totalCost;
@@ -1599,6 +1696,8 @@ async function executeTask(
     cwd: string;
     askUserFn: (q: string) => Promise<string>;
     undoStack?: UndoEntry[];
+    thinking?: boolean;
+    hooks?: HooksConfig;
   }
 ): Promise<Awaited<ReturnType<typeof runAgentLoop>> | null> {
   printSectionHeader(`FORGE - ${opts.provider} - ${opts.model}`);
@@ -1638,12 +1737,26 @@ async function executeTask(
   }
 
   const sessionId = randomUUID();
+  const hooks = opts.hooks ?? {};
+
+  // Set up abort controller for Ctrl+C interrupt
+  const abortController = new AbortController();
+  const sigintHandler = () => {
+    console.log(chalk.yellow('\n  [TRIDENT] Interrupted. Stopping task...'));
+    abortController.abort();
+  };
+  process.once('SIGINT', sigintHandler);
 
   const onToolStart = async (call: import('./agent/tools.js').ToolCall): Promise<void> => {
     printToolStart(call);
   };
 
   const beforeToolExecute = async (call: import('./agent/tools.js').ToolCall): Promise<void> => {
+    // Run before_tool hook if configured
+    if (hooks.before_tool?.[call.name]) {
+      await runHook(hooks.before_tool[call.name], opts.cwd);
+    }
+
     if (!opts.undoStack || (call.name !== 'write_file' && call.name !== 'edit_file' && call.name !== 'delete_file')) {
       return;
     }
@@ -1658,6 +1771,14 @@ async function executeTask(
     opts.undoStack.push({ path: filePath, originalContent });
   };
 
+  const onToolEnd = (call: import('./agent/tools.js').ToolCall, result: import('./agent/tools.js').ToolResult): void => {
+    printToolEnd(call, result);
+    // Run after_tool hook if configured (fire-and-forget)
+    if (hooks.after_tool?.[call.name]) {
+      runHook(hooks.after_tool[call.name], opts.cwd).catch(() => {});
+    }
+  };
+
   try {
     const result = await runAgentLoop(task, {
       cwd: opts.cwd,
@@ -1669,6 +1790,8 @@ async function executeTask(
       budgetUsd: opts.budgetUsd,
       logSessions: opts.logSessions,
       sessionId,
+      thinking: opts.thinking,
+      abortSignal: abortController.signal,
       onTurnStart: process.stdout.isTTY
         ? (turn, maxTurns) => {
             const spinner = ora({ text: chalk.dim(`thinking · turn ${turn}/${maxTurns}`), color: 'cyan', discardStdin: false }).start();
@@ -1683,7 +1806,7 @@ async function executeTask(
       onText: printAgentText,
       onToolStart,
       beforeToolExecute,
-      onToolEnd: printToolEnd,
+      onToolEnd,
       onCostUpdate: printCostUpdate,
       askUserFn: opts.askUserFn,
     });
@@ -1694,6 +1817,8 @@ async function executeTask(
     console.log('');
     printError(err instanceof Error ? err.message : String(err));
     return null;
+  } finally {
+    process.removeListener('SIGINT', sigintHandler);
   }
 }
 
