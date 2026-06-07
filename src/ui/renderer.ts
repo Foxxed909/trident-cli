@@ -134,7 +134,7 @@ export function printToolEnd(call: ToolCall, result: ToolResult): void {
 }
 
 function shouldShowOutput(call: ToolCall): boolean {
-  return call.name === 'read_file' || call.name === 'list_dir' || call.name === 'search_codebase' || call.name === 'run_command';
+  return call.name === 'read_file' || call.name === 'list_dir' || call.name === 'search_codebase' || call.name === 'run_command' || call.name === 'web_search' || call.name === 'github_api';
 }
 
 function firstLine(s: string, max: number): string {
@@ -272,11 +272,17 @@ export function printSlashHelp(): void {
         ['/resume <n>', 'load past session as context (n = number from /sessions)'],
         ['/replay <n>', 're-execute approved tool calls from a past session'],
         ['/save [file]', 'save session transcript to a file'],
-        ['/compact', 'summarize and trim session history'],
+        ['/compact', 'AI-summarise and trim session history'],
         ['/budget [usd|clear]', 'show, set, or clear the session budget'],
         ['/profile [name|clear]', 'show or switch trained profile'],
         ['/profiles', 'list trained profiles'],
         ['/override [text|clear]', 'show or set system override'],
+        ['/memory', 'show persistent agent memory'],
+        ['/forget', 'clear all agent memory'],
+        ['/plan [on|off]', 'toggle plan-before-act mode'],
+        ['/queue [add|list|run|clear]', 'manage sequential task queue'],
+        ['/autotest [on|off]', 'run tests after each file write'],
+        ['/autoformat [on|off]', 'format files after each write'],
       ],
     },
     {
@@ -337,6 +343,9 @@ export function printStatus(opts: {
   profile?: string;
   systemOverrideActive?: boolean;
   pinnedCount?: number;
+  contextUsedTokens?: number;
+  contextLimitTokens?: number;
+  planMode?: boolean;
 }): void {
   console.log('');
   console.log('  ' + chalk.hex(TEAL).bold('Session status'));
@@ -345,6 +354,7 @@ export function printStatus(opts: {
     ['provider', opts.provider],
     ['model', opts.model],
     ['profile', opts.profile || 'none'],
+    ['plan', opts.planMode ? chalk.hex(TEAL)('ON') : chalk.hex(SLATE)('off')],
     ['override', opts.systemOverrideActive ? 'active' : 'none'],
     ['pinned', opts.pinnedCount ? `${opts.pinnedCount} file(s)` : 'none'],
     ['mode', opts.mode],
@@ -364,6 +374,18 @@ export function printStatus(opts: {
   for (const [key, value] of rows) {
     console.log('    ' + chalk.hex(SLATE)(key.padEnd(10)) + chalk.white(value));
   }
+
+  if (opts.contextUsedTokens !== undefined && opts.contextLimitTokens && opts.contextLimitTokens > 0) {
+    const pct = Math.min(1, opts.contextUsedTokens / opts.contextLimitTokens);
+    const barWidth = 20;
+    const filled = Math.round(pct * barWidth);
+    const empty = barWidth - filled;
+    const barColor = pct >= 0.9 ? ROSE : pct >= 0.7 ? AMBER : TEAL;
+    const bar = chalk.hex(barColor)('█'.repeat(filled)) + chalk.hex(SLATE)('░'.repeat(empty));
+    const pctStr = `${Math.round(pct * 100)}%`;
+    console.log('    ' + chalk.hex(SLATE)('context   ') + '[' + bar + '] ' + chalk.hex(barColor)(pctStr));
+  }
+
   console.log('');
 }
 
@@ -373,11 +395,15 @@ function formatToolPreview(call: ToolCall): string {
     case 'read_file':
     case 'write_file':
     case 'edit_file':
-    case 'delete_file': return call.input.path as string;
+    case 'delete_file':
+    case 'git_blame': return call.input.path as string;
     case 'list_dir': return (call.input.path as string) + (call.input.recursive ? ' (recursive)' : '');
-    case 'search_codebase': return `"${truncate(call.input.query as string, 60)}"`;
+    case 'search_codebase':
+    case 'web_search': return `"${truncate((call.input.query as string), 60)}"`;
     case 'web_fetch': return call.input.url as string;
     case 'ask_user': return `"${truncate(call.input.question as string, 60)}"`;
+    case 'memory_update': return truncate(call.input.fact as string, 60);
+    case 'github_api': return `${call.input.method || 'GET'} ${truncate(call.input.endpoint as string, 60)}`;
     case 'final_answer': return '';
     default: return '';
   }

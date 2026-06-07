@@ -14,8 +14,8 @@ import { readFile as fsReadFile, writeFile as fsWriteFile, unlink as fsUnlink } 
 import { getConfig, getRawConfig, getDefaultConfig, resetConfigToDefaults, setConfig, deleteConfig, getConfigPath, ConfigSchema } from './config.js';
 import type { TridentConfig } from './config.js';
 import { runOnboarding } from './ui/onboarding.js';
-import { loadOrCreateContext, generateTridentMd, buildSystemPrompt, generateProjectTree } from './oracle/index.js';
-import { runAgentLoop, type ProviderName as AgentProviderName } from './agent/loop.js';
+import { loadOrCreateContext, generateTridentMd, buildSystemPrompt, generateProjectTree, loadMemory, clearMemory } from './oracle/index.js';
+import { runAgentLoop, getContextLimit, type ProviderName as AgentProviderName } from './agent/loop.js';
 import { resolveWorkspacePath } from './agent/tools.js';
 import { listOpenRouterModels } from './providers/openrouter.js';
 import { codexSandboxForMode, isCodexCliAvailable, runCodexExec } from './providers/codex.js';
@@ -562,11 +562,17 @@ async function showCommandPicker(
         { cmd: '/snapshot', desc: 'git stash current state as a named snapshot' },
         { cmd: '/resume', desc: 'load a past session as context' },
         { cmd: '/replay', desc: 're-execute approved tool calls from a past session' },
-        { cmd: '/compact', desc: 'trim session history and undo stack' },
+        { cmd: '/compact', desc: 'AI-summarise and trim session history' },
         { cmd: '/save', desc: 'save session transcript to a .md file' },
         { cmd: '/budget', desc: 'show, set, or clear session budget' },
         { cmd: '/profile', desc: 'show or switch trained profile' },
         { cmd: '/override', desc: 'show or set system override' },
+        { cmd: '/memory', desc: 'show persistent agent memory' },
+        { cmd: '/forget', desc: 'clear all agent memory' },
+        { cmd: '/plan', desc: 'toggle plan-before-act mode' },
+        { cmd: '/queue', desc: 'manage sequential task queue' },
+        { cmd: '/autotest', desc: 'toggle auto-test after file writes' },
+        { cmd: '/autoformat', desc: 'toggle auto-format after file writes' },
       ],
     },
     {
@@ -688,10 +694,18 @@ async function runTrident(
     return parts.join('\n\n');
   };
 
-  const getSystemPrompt = (): string => buildSystemPrompt(ctx, {
-    profile: activeProfile,
-    systemOverride: [systemOverride, getPinnedContext()].filter(Boolean).join('\n\n'),
-  });
+  const getSystemPrompt = (): string => {
+    const memorySection = sessionMemory.trim()
+      ? `\n\n## Agent Memory\n${sessionMemory.trim()}`
+      : '';
+    const planSection = session.planMode
+      ? '\n\n## Plan Mode\nBefore taking any action, produce a numbered plan and wait for the user to confirm or refine it. Only proceed with tool calls after the plan is accepted.'
+      : '';
+    return buildSystemPrompt(ctx, {
+      profile: activeProfile,
+      systemOverride: [systemOverride, getPinnedContext(), memorySection + planSection].filter(Boolean).join('\n\n'),
+    });
+  };
 
   printSessionHeader({ model, mode, provider, project: ctx.name, hasTridentMd: !!ctx.tridentMdContent, profile: activeProfile?.name });
 
@@ -763,6 +777,8 @@ async function runTrident(
 
   printWelcome();
 
+  let sessionMemory = await loadMemory();
+
   const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
   const session = {
     mode,
@@ -774,7 +790,11 @@ async function runTrident(
     tokens: { input: 0, output: 0 },
     turns: 0,
     budgetUsd: budgetUsd ?? config.budgetUsd,
+    planMode: false,
+    autoTest: false,
+    autoFormat: false,
   };
+  const taskQueue: string[] = [];
   const undoStack: UndoEntry[] = [];
   const taskHistory: Array<{ task: string; summary: string; cost: number }> = [];
   const turnCostLog: Array<{ taskIdx: number; turn: number; cost: number }> = [];
@@ -839,6 +859,9 @@ async function runTrident(
           profile: session.profile,
           systemOverrideActive: session.systemOverride.trim().length > 0,
           pinnedCount: pinnedFiles.size,
+          planMode: session.planMode,
+          contextUsedTokens: session.tokens.input + session.tokens.output,
+          contextLimitTokens: getContextLimit(session.model),
         });
         return true;
       }
@@ -887,6 +910,9 @@ async function runTrident(
           cwd,
           askUserFn,
           undoStack,
+          autoTest: session.autoTest,
+          autoFormat: session.autoFormat,
+          planMode: session.planMode,
         });
         if (result) {
           session.cost += result.totalCost;
@@ -927,11 +953,43 @@ async function runTrident(
           printInfo('No history to compact.');
           return true;
         }
-        const kept = taskHistory.splice(-3);
-        taskHistory.length = 0;
-        taskHistory.push(...kept);
-        undoStack.length = 0;
-        printSuccess(`Compacted - kept last ${kept.length} task(s), undo stack cleared.`);
+        if (session.provider === 'codex') {
+          const kept = taskHistory.splice(-3);
+          taskHistory.length = 0;
+          taskHistory.push(...kept);
+          undoStack.length = 0;
+          printSuccess(`Compacted - kept last ${kept.length} task(s), undo stack cleared.`);
+          return true;
+        }
+        const spinner = ora({ text: chalk.dim('summarising history...'), color: 'cyan', discardStdin: false }).start();
+        try {
+          const historyText = taskHistory.map((h, i) =>
+            `Task ${i + 1}: ${h.task}\nResult: ${h.summary}`
+          ).join('\n\n');
+          const { streamCompletion: sc } = await import('./providers/anthropic.js');
+          const { streamOpenRouter: sor } = await import('./providers/openrouter.js');
+          const compactMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [{
+            role: 'user',
+            content: `Summarise the following session history into a concise paragraph that captures key outcomes, files changed, and important context. Write in plain prose, no bullet points.\n\n${historyText}`,
+          }];
+          const compactStream = session.provider === 'openrouter'
+            ? sor(compactMessages as never, { model: session.model, maxTokens: 512, systemPrompt: 'You are a concise summariser.', tools: [], apiKey: process.env.OPENROUTER_API_KEY || '' })
+            : sc(compactMessages as never, { model: session.model, maxTokens: 512, systemPrompt: 'You are a concise summariser.', tools: [] });
+          let summary = '';
+          for await (const chunk of compactStream) {
+            if (chunk.type === 'text' && chunk.text) summary += chunk.text;
+          }
+          spinner.stop();
+          process.stdout.write('\r\x1b[K');
+          taskHistory.length = 0;
+          taskHistory.push({ task: '[compacted]', summary: summary.trim() || 'Session history compacted.', cost: 0 });
+          undoStack.length = 0;
+          printSuccess('History summarised and compacted. Undo stack cleared.');
+        } catch (err) {
+          spinner.stop();
+          process.stdout.write('\r\x1b[K');
+          printError(`Compact failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
         return true;
       }
 
@@ -1491,6 +1549,127 @@ async function runTrident(
         return true;
       }
 
+      case 'memory': {
+        const mem = sessionMemory.trim();
+        if (!mem) {
+          printInfo('Memory is empty. The agent will write facts using the memory_update tool.');
+        } else {
+          console.log('');
+          console.log('  ' + chalk.hex('#5EEAD4').bold('Agent memory'));
+          console.log(chalk.hex('#94A3B8').dim('-'.repeat(60)));
+          for (const line of mem.split('\n')) {
+            console.log('  ' + chalk.hex('#94A3B8')(line));
+          }
+          console.log(chalk.hex('#94A3B8').dim('-'.repeat(60)));
+          console.log('');
+        }
+        return true;
+      }
+
+      case 'forget': {
+        await clearMemory();
+        sessionMemory = '';
+        printSuccess('Memory cleared.');
+        return true;
+      }
+
+      case 'plan': {
+        if (arg === 'on' || arg === '') {
+          session.planMode = true;
+          printSuccess('Plan mode ON — agent will draft a plan before acting.');
+        } else if (arg === 'off') {
+          session.planMode = false;
+          printSuccess('Plan mode OFF.');
+        } else {
+          printError('Usage: /plan [on|off]');
+        }
+        return true;
+      }
+
+      case 'queue': {
+        const [subCmd, ...queueRest] = (arg || '').split(/\s+/);
+        const queueArg = queueRest.join(' ').trim();
+        if (!subCmd || subCmd === 'list') {
+          if (taskQueue.length === 0) {
+            printInfo('Task queue is empty. Add tasks with /queue add <task>.');
+          } else {
+            console.log('');
+            console.log('  ' + chalk.hex('#5EEAD4').bold('Task queue'));
+            taskQueue.forEach((t, i) => {
+              console.log(`    ${chalk.hex('#94A3B8').dim(String(i + 1) + '.')} ${chalk.white(t)}`);
+            });
+            console.log('');
+          }
+        } else if (subCmd === 'add') {
+          if (!queueArg) { printError('Usage: /queue add <task>'); return true; }
+          taskQueue.push(queueArg);
+          printSuccess(`Queued task ${taskQueue.length}: ${queueArg}`);
+        } else if (subCmd === 'clear') {
+          taskQueue.length = 0;
+          printSuccess('Task queue cleared.');
+        } else if (subCmd === 'run') {
+          if (taskQueue.length === 0) { printInfo('Task queue is empty.'); return true; }
+          const queued = taskQueue.splice(0);
+          printInfo(`Running ${queued.length} queued task(s)...`);
+          for (let qi = 0; qi < queued.length; qi++) {
+            const qt = queued[qi];
+            printSectionHeader(`Queue ${qi + 1}/${queued.length}: ${qt}`);
+            if (session.budgetUsd !== undefined && session.cost >= session.budgetUsd) {
+              printWarn('Budget exhausted — stopping queue.');
+              break;
+            }
+            const qResult = await executeTask(qt, {
+              model: session.model, mode: session.mode, provider: session.provider,
+              maxTurns, budgetUsd: remainingBudget(session),
+              logSessions: config.logSessions, systemPrompt: getSystemPrompt(),
+              profile: activeProfile, codexTimeoutMs, cwd, askUserFn, undoStack,
+              autoTest: session.autoTest, autoFormat: session.autoFormat, planMode: session.planMode,
+            });
+            if (qResult) {
+              session.cost += qResult.totalCost;
+              session.tokens.input += qResult.totalTokens.input;
+              session.tokens.output += qResult.totalTokens.output;
+              session.turns += qResult.turns;
+              const qIdx = taskHistory.length;
+              taskHistory.push({ task: qt, summary: qResult.summary, cost: qResult.totalCost });
+              for (const tc of qResult.turnCosts ?? []) {
+                turnCostLog.push({ taskIdx: qIdx, turn: tc.turn, cost: tc.cost });
+              }
+            }
+          }
+          printSuccess('Queue complete.');
+        } else {
+          printError('Usage: /queue [add <task>|list|run|clear]');
+        }
+        return true;
+      }
+
+      case 'autotest': {
+        if (arg === 'on' || (!arg && !session.autoTest)) {
+          session.autoTest = true;
+          printSuccess('Auto-test ON — tests will run after each file write.');
+        } else if (arg === 'off' || (!arg && session.autoTest)) {
+          session.autoTest = false;
+          printSuccess('Auto-test OFF.');
+        } else {
+          printError('Usage: /autotest [on|off]');
+        }
+        return true;
+      }
+
+      case 'autoformat': {
+        if (arg === 'on' || (!arg && !session.autoFormat)) {
+          session.autoFormat = true;
+          printSuccess('Auto-format ON — files will be formatted after each write.');
+        } else if (arg === 'off' || (!arg && session.autoFormat)) {
+          session.autoFormat = false;
+          printSuccess('Auto-format OFF.');
+        } else {
+          printError('Usage: /autoformat [on|off]');
+        }
+        return true;
+      }
+
       default:
         printWarn(`Unknown command: /${head}. Type / then Enter for the menu, or /help for the list.`);
         return true;
@@ -1548,6 +1727,9 @@ async function runTrident(
       cwd,
       askUserFn,
       undoStack,
+      autoTest: session.autoTest,
+      autoFormat: session.autoFormat,
+      planMode: session.planMode,
     });
 
     if (result) {
@@ -1599,6 +1781,9 @@ async function executeTask(
     cwd: string;
     askUserFn: (q: string) => Promise<string>;
     undoStack?: UndoEntry[];
+    autoTest?: boolean;
+    autoFormat?: boolean;
+    planMode?: boolean;
   }
 ): Promise<Awaited<ReturnType<typeof runAgentLoop>> | null> {
   printSectionHeader(`FORGE - ${opts.provider} - ${opts.model}`);
@@ -1669,6 +1854,8 @@ async function executeTask(
       budgetUsd: opts.budgetUsd,
       logSessions: opts.logSessions,
       sessionId,
+      autoTest: opts.autoTest ?? false,
+      autoFormat: opts.autoFormat ?? false,
       onTurnStart: process.stdout.isTTY
         ? (turn, maxTurns) => {
             const spinner = ora({ text: chalk.dim(`thinking · turn ${turn}/${maxTurns}`), color: 'cyan', discardStdin: false }).start();
@@ -1678,6 +1865,11 @@ async function executeTask(
       onTurnComplete: (turn, turnCost) => {
         if (process.stdout.isTTY) {
           process.stdout.write(chalk.dim(`\n  ↳ turn ${turn} · $${turnCost.toFixed(5)}\n`));
+        }
+      },
+      onContextPressure: () => {
+        if (process.stdout.isTTY) {
+          process.stdout.write(chalk.hex('#F5C97A')('\n  [TRIDENT] Context approaching limit — consider /compact\n'));
         }
       },
       onText: printAgentText,

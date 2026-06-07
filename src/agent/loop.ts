@@ -1,4 +1,6 @@
 import chalk from 'chalk';
+import { extname } from 'path';
+import { execa } from 'execa';
 import { createDiffView } from '../ui/diff.js';
 import { streamCompletion, calculateCost } from '../providers/anthropic.js';
 import { streamOpenRouter, calculateOpenRouterCost } from '../providers/openrouter.js';
@@ -8,6 +10,31 @@ import type { ChatMessage } from '../providers/anthropic.js';
 import type { ApprovalMode } from '../warden/index.js';
 
 export type ProviderName = 'anthropic' | 'openrouter';
+
+export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
+  'claude-opus-4-7':           200000,
+  'claude-opus-4-5':           200000,
+  'claude-sonnet-4-6':         200000,
+  'claude-sonnet-4-5':         200000,
+  'claude-haiku-4-5-20251001': 200000,
+};
+
+export function getContextLimit(model: string): number {
+  return MODEL_CONTEXT_LIMITS[model] ?? 200000;
+}
+
+const FORMATTERS: Record<string, string> = {
+  '.ts': 'npx --yes prettier --write',
+  '.tsx': 'npx --yes prettier --write',
+  '.js': 'npx --yes prettier --write',
+  '.jsx': 'npx --yes prettier --write',
+  '.json': 'npx --yes prettier --write',
+  '.css': 'npx --yes prettier --write',
+  '.html': 'npx --yes prettier --write',
+  '.py': 'black',
+  '.go': 'gofmt -w',
+  '.rs': 'rustfmt',
+};
 
 export interface AgentOptions {
   cwd: string;
@@ -26,6 +53,13 @@ export interface AgentOptions {
   onCostUpdate?: (totalCost: number, tokens: { input: number; output: number }) => void;
   onTurnComplete?: (turn: number, turnCost: number, turnTokens: { input: number; output: number }) => void;
   onTurnStart?: (turn: number, maxTurns: number) => (() => void) | void;
+  onContextPressure?: () => void;
+  autoTest?: boolean;
+  testCommand?: string;
+  autoFormat?: boolean;
+  thinking?: boolean;
+  thinkingBudget?: number;
+  abortSignal?: AbortSignal;
   askUserFn: (question: string) => Promise<string>;
 }
 
@@ -159,6 +193,11 @@ export async function runAgentLoop(
       warnedMaxTurns = true;
     }
 
+    const contextPct = Math.round(((totalInputTokens + totalOutputTokens) / getContextLimit(opts.model)) * 100);
+    if (contextPct >= 80 && !warnedMaxTurns) {
+      opts.onContextPressure?.();
+    }
+
     const runningCost = isOpenRouter
       ? calculateOpenRouterCost(opts.model, totalInputTokens, totalOutputTokens)
       : calculateCost(opts.model, totalInputTokens, totalOutputTokens);
@@ -219,9 +258,30 @@ export async function runAgentLoop(
 
       await logger.log({ toolName: call.name, input: call.input, result, approved: true, riskLevel: risk });
 
-      const baseContent = result.success
+      let baseContent = result.success
         ? result.output
         : `ERROR: ${result.error}\n${result.output}`;
+
+      // Auto-format after successful writes
+      if (result.success && opts.autoFormat && (call.name === 'write_file' || call.name === 'edit_file')) {
+        const filePath = call.input.path as string;
+        const ext = extname(filePath);
+        const fmtCmd = FORMATTERS[ext];
+        if (fmtCmd) {
+          const isWin = process.platform === 'win32';
+          await execa(isWin ? 'cmd' : 'bash', [isWin ? '/c' : '-c', `${fmtCmd} "${filePath}"`], { cwd: opts.cwd, reject: false, timeout: 15000 }).catch(() => {});
+          baseContent += '\n[auto-formatted]';
+        }
+      }
+
+      // Auto-test after successful writes
+      if (result.success && opts.autoTest && opts.testCommand && (call.name === 'write_file' || call.name === 'edit_file')) {
+        const isWin = process.platform === 'win32';
+        const testRes = await execa(isWin ? 'cmd' : 'bash', [isWin ? '/c' : '-c', opts.testCommand], { cwd: opts.cwd, reject: false, timeout: 60000, all: true });
+        const testOut = (typeof testRes.all === 'string' ? testRes.all : '').slice(-3000);
+        const testStatus = testRes.exitCode === 0 ? 'PASS' : 'FAIL';
+        baseContent += `\n\n[auto-test: ${testStatus}]\n${testOut}`;
+      }
 
       // Auto-retry hint when an edit was ambiguous so the agent knows to use more context
       const isAmbiguousEdit = !result.success && typeof result.error === 'string' && result.error.includes('Ambiguous edit');

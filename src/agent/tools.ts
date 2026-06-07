@@ -3,6 +3,7 @@ import { existsSync } from 'fs';
 import { join, resolve, relative, isAbsolute } from 'path';
 import { execa } from 'execa';
 import fg from 'fast-glob';
+import { appendMemory } from '../oracle/index.js';
 
 export interface ToolResult {
   success: boolean;
@@ -21,7 +22,11 @@ export type ToolName =
   | 'search_codebase'
   | 'web_fetch'
   | 'ask_user'
-  | 'final_answer';
+  | 'final_answer'
+  | 'memory_update'
+  | 'git_blame'
+  | 'web_search'
+  | 'github_api';
 
 export interface ToolCall {
   name: ToolName;
@@ -261,6 +266,86 @@ export async function executeTool(
         return { success: true, output: summary, duration_ms: Date.now() - start };
       }
 
+      case 'memory_update': {
+        const { fact } = call.input as { fact: string };
+        if (!fact?.trim()) {
+          return { success: false, output: '', error: 'fact is required', duration_ms: Date.now() - start };
+        }
+        await appendMemory(fact.trim());
+        return { success: true, output: `Memory updated: ${fact.trim()}`, duration_ms: Date.now() - start };
+      }
+
+      case 'git_blame': {
+        const { path: filePath, line } = call.input as { path: string; line?: number };
+        const absPath = resolveWorkspacePath(cwd, filePath);
+        const isWin = process.platform === 'win32';
+        const lineFlag = line ? `-L ${line},${line}` : '';
+        const res = await execa(isWin ? 'cmd' : 'bash', [isWin ? '/c' : '-c', `git blame ${lineFlag} -- "${absPath}"`], {
+          cwd, reject: false, all: true, timeout: 15000,
+        });
+        const out = typeof res.all === 'string' ? res.all : '';
+        if (res.exitCode !== 0) {
+          return { success: false, output: out, error: `git blame failed (exit ${res.exitCode})`, duration_ms: Date.now() - start };
+        }
+        return { success: true, output: out.slice(0, 8000), duration_ms: Date.now() - start };
+      }
+
+      case 'web_search': {
+        const { query } = call.input as { query: string };
+        let html: string;
+        try {
+          const resp = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
+            signal: AbortSignal.timeout(15000),
+            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TRIDENT/1.0)' },
+          });
+          html = await resp.text();
+        } catch (e) {
+          return { success: false, output: '', error: `Search request failed: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start };
+        }
+        // Extract result snippets from DuckDuckGo HTML
+        const snippets: string[] = [];
+        const titleRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]*>([^<]+)<\/a>/g;
+        const snippetRe = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([^<]+)<\/a>/g;
+        const titleMatches = [...html.matchAll(titleRe)].slice(0, 8);
+        const snippetMatches = [...html.matchAll(snippetRe)].slice(0, 8);
+        for (let i = 0; i < Math.min(titleMatches.length, 8); i++) {
+          const title = titleMatches[i]?.[1]?.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim() || '';
+          const snippet = snippetMatches[i]?.[1]?.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim() || '';
+          if (title) snippets.push(`${i + 1}. ${title}${snippet ? '\n   ' + snippet : ''}`);
+        }
+        if (snippets.length === 0) {
+          return { success: true, output: `No results found for "${query}"`, duration_ms: Date.now() - start };
+        }
+        return { success: true, output: `Search results for "${query}":\n\n${snippets.join('\n\n')}`, duration_ms: Date.now() - start };
+      }
+
+      case 'github_api': {
+        const { endpoint, method = 'GET', body } = call.input as { endpoint: string; method?: string; body?: Record<string, unknown> };
+        const token = process.env.GITHUB_TOKEN;
+        const headers: Record<string, string> = {
+          'Accept': 'application/vnd.github.v3+json',
+          'User-Agent': 'TRIDENT-CLI/1.0',
+        };
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        const url = endpoint.startsWith('http') ? endpoint : `https://api.github.com${endpoint.startsWith('/') ? '' : '/'}${endpoint}`;
+        let resp: Response;
+        try {
+          resp = await fetch(url, {
+            method,
+            headers,
+            body: body ? JSON.stringify(body) : undefined,
+            signal: AbortSignal.timeout(20000),
+          });
+        } catch (e) {
+          return { success: false, output: '', error: `GitHub API request failed: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start };
+        }
+        const text = await resp.text();
+        if (!resp.ok) {
+          return { success: false, output: text.slice(0, 2000), error: `GitHub API HTTP ${resp.status}`, duration_ms: Date.now() - start };
+        }
+        return { success: true, output: text.slice(0, 16000), duration_ms: Date.now() - start };
+      }
+
       default:
         return { success: false, output: '', error: `Unknown tool: ${(call as ToolCall).name}`, duration_ms: Date.now() - start };
     }
@@ -404,6 +489,49 @@ export const TOOL_DEFINITIONS = [
       type: 'object',
       properties: { summary: { type: 'string', description: 'Summary of what was accomplished' } },
       required: ['summary'],
+    },
+  },
+  {
+    name: 'memory_update',
+    description: 'Persist a fact or note to long-term agent memory. Use this to remember important project details, user preferences, or decisions across sessions.',
+    input_schema: {
+      type: 'object',
+      properties: { fact: { type: 'string', description: 'The fact or note to remember' } },
+      required: ['fact'],
+    },
+  },
+  {
+    name: 'git_blame',
+    description: 'Show git blame for a file to see who last modified each line',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Path to the file' },
+        line: { type: 'number', description: 'Optional specific line number to blame' },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'web_search',
+    description: 'Search the web using DuckDuckGo and return top results',
+    input_schema: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'Search query' } },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'github_api',
+    description: 'Call the GitHub REST API. Requires GITHUB_TOKEN env var for authenticated requests.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        endpoint: { type: 'string', description: 'GitHub API endpoint path (e.g. /repos/owner/repo/issues) or full URL' },
+        method: { type: 'string', description: 'HTTP method: GET, POST, PATCH, DELETE (default: GET)' },
+        body: { type: 'object', description: 'Optional JSON request body for POST/PATCH' },
+      },
+      required: ['endpoint'],
     },
   },
 ];

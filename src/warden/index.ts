@@ -25,13 +25,19 @@ export function classifyRisk(call: ToolCall): RiskLevel {
     case 'list_dir':
     case 'search_codebase':
     case 'web_fetch':
+    case 'web_search':
+    case 'git_blame':
     case 'ask_user':
     case 'final_answer':
       return 'read';
 
     case 'write_file':
     case 'edit_file':
+    case 'memory_update':
       return 'write';
+
+    case 'github_api':
+      return 'execute';
 
     case 'run_command': {
       const cmd = ((call.input.cmd as string) || '').trim();
@@ -128,7 +134,14 @@ function formatInputPreview(call: ToolCall): string {
     case 'edit_file':
     case 'delete_file':
     case 'read_file':
+    case 'git_blame':
       return `  file ${chalk.cyan(call.input.path as string)}`;
+    case 'memory_update':
+      return `  fact: ${chalk.cyan(String(call.input.fact || '').slice(0, 60))}`;
+    case 'web_search':
+      return `  query: ${chalk.cyan(String(call.input.query || '').slice(0, 60))}`;
+    case 'github_api':
+      return `  ${call.input.method || 'GET'} ${chalk.cyan(String(call.input.endpoint || '').slice(0, 60))}`;
     default:
       return '';
   }
