@@ -257,7 +257,7 @@ export function printSlashHelp(): void {
       cmds: [
         ['/help', 'show this help'],
         ['/status', 'show model / provider / mode / cost'],
-        ['/cost', 'show running cost and token totals'],
+        ['/cost [breakdown]', 'show cost totals (breakdown = per-turn table)'],
         ['/history', 'show tasks run this session'],
         ['/clear', 'clear the screen'],
         ['/exit', 'quit (or Ctrl+C)'],
@@ -268,6 +268,9 @@ export function printSlashHelp(): void {
       cmds: [
         ['/retry', 're-run the last task'],
         ['/undo', 'revert last file write or edit'],
+        ['/snapshot [label]', 'git stash current state as a named snapshot'],
+        ['/resume <n>', 'load past session as context (n = number from /sessions)'],
+        ['/replay <n>', 're-execute approved tool calls from a past session'],
         ['/save [file]', 'save session transcript to a file'],
         ['/compact', 'summarize and trim session history'],
         ['/budget [usd|clear]', 'show, set, or clear the session budget'],
@@ -279,9 +282,12 @@ export function printSlashHelp(): void {
     {
       label: 'Project',
       cmds: [
-        ['/search <query>', 'quick codebase keyword search (no agent needed)'],
+        ['/search [--regex] <q>', 'quick codebase search (--regex for regex mode)'],
         ['/git [args]', 'run a git command in the project root (default: status)'],
         ['/diff [file]', 'show git diff for working tree or a specific file'],
+        ['/pin <file>', 'pin a file into system prompt (always in AI context)'],
+        ['/unpin <file|all>', 'unpin a file or clear all pinned files'],
+        ['/pinned', 'list currently pinned files'],
         ['/init', 'generate TRIDENT.md for the current project'],
         ['/context', 'show current TRIDENT.md contents'],
         ['/tree', 'show project file tree'],
@@ -330,6 +336,7 @@ export function printStatus(opts: {
   turns: number;
   profile?: string;
   systemOverrideActive?: boolean;
+  pinnedCount?: number;
 }): void {
   console.log('');
   console.log('  ' + chalk.hex(TEAL).bold('Session status'));
@@ -339,6 +346,7 @@ export function printStatus(opts: {
     ['model', opts.model],
     ['profile', opts.profile || 'none'],
     ['override', opts.systemOverrideActive ? 'active' : 'none'],
+    ['pinned', opts.pinnedCount ? `${opts.pinnedCount} file(s)` : 'none'],
     ['mode', opts.mode],
     ['turns', String(opts.turns)],
     ['tokens', `${total.toLocaleString()} (in: ${opts.tokens.input.toLocaleString()}, out: ${opts.tokens.output.toLocaleString()})`],

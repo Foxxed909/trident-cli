@@ -24,6 +24,8 @@ export interface AgentOptions {
   beforeToolExecute?: (call: ToolCall) => void | Promise<void>;
   onToolEnd?: (call: ToolCall, result: ToolResult) => void;
   onCostUpdate?: (totalCost: number, tokens: { input: number; output: number }) => void;
+  onTurnComplete?: (turn: number, turnCost: number, turnTokens: { input: number; output: number }) => void;
+  onTurnStart?: (turn: number, maxTurns: number) => (() => void) | void;
   askUserFn: (question: string) => Promise<string>;
 }
 
@@ -33,6 +35,7 @@ export interface AgentResult {
   turns: number;
   totalCost: number;
   totalTokens: { input: number; output: number };
+  turnCosts: Array<{ turn: number; cost: number }>;
 }
 
 export async function runAgentLoop(
@@ -50,9 +53,20 @@ export async function runAgentLoop(
   let budgetExceeded = false;
   let warnedMaxTurns = false;
   const isOpenRouter = opts.provider === 'openrouter';
+  const turnCostHistory: Array<{ turn: number; cost: number }> = [];
 
   while (turns < opts.maxTurns) {
     turns++;
+
+    // Start per-turn spinner; returns a stop function called on first output
+    const _stopSpinFn = opts.onTurnStart?.(turns, opts.maxTurns);
+    let spinStopped = false;
+    const stopSpin = () => {
+      if (!spinStopped) {
+        spinStopped = true;
+        _stopSpinFn?.();
+      }
+    };
 
     let assistantText = '';
     let pendingToolCalls: Array<{ id: string; name: ToolCall['name']; input: Record<string, unknown> }> = [];
@@ -83,9 +97,11 @@ export async function runAgentLoop(
 
         for await (const chunk of stream) {
           if (chunk.type === 'text' && chunk.text) {
+            stopSpin();
             assistantText += chunk.text;
             opts.onText?.(chunk.text);
           } else if (chunk.type === 'tool_call' && chunk.toolCall) {
+            stopSpin();
             pendingToolCalls.push(chunk.toolCall);
           } else if (chunk.type === 'usage' && chunk.usage) {
             turnInputTokens = chunk.usage.inputTokens;
@@ -93,14 +109,23 @@ export async function runAgentLoop(
           }
         }
 
+        stopSpin(); // ensure stopped even on usage-only responses
+
         totalInputTokens += turnInputTokens;
         totalOutputTokens += turnOutputTokens;
         const cost = isOpenRouter
           ? calculateOpenRouterCost(opts.model, totalInputTokens, totalOutputTokens)
           : calculateCost(opts.model, totalInputTokens, totalOutputTokens);
         opts.onCostUpdate?.(cost, { input: totalInputTokens, output: totalOutputTokens });
+
+        const turnCost = isOpenRouter
+          ? calculateOpenRouterCost(opts.model, turnInputTokens, turnOutputTokens)
+          : calculateCost(opts.model, turnInputTokens, turnOutputTokens);
+        turnCostHistory.push({ turn: turns, cost: turnCost });
+        opts.onTurnComplete?.(turns, turnCost, { input: turnInputTokens, output: turnOutputTokens });
         break;
       } catch (err) {
+        stopSpin();
         const error = err instanceof Error ? err : new Error(String(err));
         const isTransient = /ECONNRESET|ETIMEDOUT|rate.?limit|overloaded|503|529/i.test(error.message);
         if (!isTransient || streamAttempt >= 2) {
@@ -194,14 +219,20 @@ export async function runAgentLoop(
 
       await logger.log({ toolName: call.name, input: call.input, result, approved: true, riskLevel: risk });
 
-      const resultContent = result.success
+      const baseContent = result.success
         ? result.output
         : `ERROR: ${result.error}\n${result.output}`;
+
+      // Auto-retry hint when an edit was ambiguous so the agent knows to use more context
+      const isAmbiguousEdit = !result.success && typeof result.error === 'string' && result.error.includes('Ambiguous edit');
+      const messageContent = isAmbiguousEdit
+        ? `${baseContent}\n\nHINT: Retry edit_file with a more specific old_str — include additional surrounding lines above and below the target so the match is unique.`
+        : baseContent;
 
       toolResults.push({
         type: 'tool_result',
         tool_use_id: tc.id,
-        content: resultContent || '(no output)',
+        content: messageContent || '(no output)',
       });
     }
 
@@ -222,6 +253,7 @@ export async function runAgentLoop(
     turns,
     totalCost,
     totalTokens: { input: totalInputTokens, output: totalOutputTokens },
+    turnCosts: turnCostHistory,
   };
 }
 

@@ -2,6 +2,7 @@
 
 import { Command } from 'commander';
 import chalk from 'chalk';
+import ora from 'ora';
 import inquirer from 'inquirer';
 import { createInterface } from 'readline';
 import { randomUUID } from 'crypto';
@@ -96,6 +97,89 @@ program
   .description('List Codex-trained TRIDENT profiles')
   .action(() => {
     printAvailableProfiles();
+  });
+
+program
+  .command('code-review')
+  .description('AI-powered code review for a specific file')
+  .argument('<file>', 'File to review')
+  .option('-m, --model <model>', 'Model to use')
+  .option('-p, --provider <provider>', 'Provider: anthropic | openrouter')
+  .action(async (file: string, opts: { model?: string; provider?: string }) => {
+    const cwd = process.cwd();
+    printLogo();
+    printInfo(`Reviewing ${file}...`);
+
+    let fileContent: string;
+    try {
+      const { resolveWorkspacePath: rwp } = await import('./agent/tools.js');
+      fileContent = await fsReadFile(rwp(cwd, file), 'utf-8');
+    } catch (err) {
+      printError(`Cannot read file: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+      return;
+    }
+
+    let cfg: TridentConfig;
+    try { cfg = getConfig(); } catch { cfg = getDefaultConfig() as TridentConfig; }
+
+    const provider = resolveProvider(opts.provider, cfg.provider) as 'anthropic' | 'openrouter';
+    const model = opts.model || cfg.model;
+
+    const envKey = provider === 'openrouter' ? 'OPENROUTER_API_KEY' : 'ANTHROPIC_API_KEY';
+    if (!process.env[envKey]) {
+      printError(`${envKey} is not set.`);
+      process.exit(1);
+      return;
+    }
+
+    const reviewPrompt = `You are an expert code reviewer. Analyse the following file and produce a structured review.
+
+File: ${file}
+\`\`\`
+${fileContent.slice(0, 30000)}
+\`\`\`
+
+Respond in this exact structure:
+
+## Summary
+One-paragraph overview of what the file does.
+
+## Issues
+For each issue, format as:
+- **[SEVERITY]** \`location\` — description and recommended fix
+  Severity levels: CRITICAL | HIGH | MEDIUM | LOW | STYLE
+
+## Positives
+Bullet-point list of good practices observed.
+
+## Recommendations
+Prioritised action items to improve the file.`;
+
+    const { streamCompletion: sc } = await import('./providers/anthropic.js');
+    const { streamOpenRouter: sor } = await import('./providers/openrouter.js');
+
+    console.log('');
+    console.log('  ' + chalk.hex('#5EEAD4').bold('> CODE REVIEW') + '  ' + chalk.dim(file));
+    console.log('');
+
+    const spinner = ora({ text: chalk.dim('analysing...'), color: 'cyan' }).start();
+    let firstToken = true;
+
+    const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [{ role: 'user', content: reviewPrompt }];
+    const stream = provider === 'openrouter'
+      ? sor(messages as never, { model, maxTokens: 4096, systemPrompt: 'You are an expert code reviewer.', tools: [], apiKey: process.env.OPENROUTER_API_KEY || '' })
+      : sc(messages as never, { model, maxTokens: 4096, systemPrompt: 'You are an expert code reviewer.', tools: [] });
+
+    for await (const chunk of stream) {
+      if (chunk.type === 'text' && chunk.text) {
+        if (firstToken) { spinner.stop(); process.stdout.write('\r\x1b[K'); firstToken = false; }
+        process.stdout.write(chalk.white(chunk.text));
+      }
+    }
+
+    if (firstToken) spinner.stop();
+    console.log('\n');
   });
 
 program
@@ -475,6 +559,9 @@ async function showCommandPicker(
       entries: [
         { cmd: '/retry', desc: 're-run the last task' },
         { cmd: '/undo', desc: 'revert last file write or edit' },
+        { cmd: '/snapshot', desc: 'git stash current state as a named snapshot' },
+        { cmd: '/resume', desc: 'load a past session as context' },
+        { cmd: '/replay', desc: 're-execute approved tool calls from a past session' },
         { cmd: '/compact', desc: 'trim session history and undo stack' },
         { cmd: '/save', desc: 'save session transcript to a .md file' },
         { cmd: '/budget', desc: 'show, set, or clear session budget' },
@@ -485,9 +572,12 @@ async function showCommandPicker(
     {
       label: 'Project',
       entries: [
-        { cmd: '/search', desc: 'quick codebase keyword search' },
+        { cmd: '/search', desc: 'quick codebase search (--regex for regex mode)' },
         { cmd: '/git', desc: 'run a git command (default: status)' },
         { cmd: '/diff', desc: 'show git diff (optional: file path)' },
+        { cmd: '/pin', desc: 'pin a file into system prompt context' },
+        { cmd: '/unpin', desc: 'unpin a file (or /unpin all)' },
+        { cmd: '/pinned', desc: 'list pinned files' },
         { cmd: '/init', desc: 'generate TRIDENT.md' },
         { cmd: '/context', desc: 'show TRIDENT.md contents' },
         { cmd: '/tree', desc: 'show project file tree' },
@@ -585,9 +675,22 @@ async function runTrident(
 
   printInfo('Loading project context...');
   const ctx = await loadOrCreateContext(cwd);
+
+  // Pinned files: path -> content, always injected into system prompt
+  const pinnedFiles = new Map<string, string>();
+  const getPinnedContext = (): string => {
+    if (pinnedFiles.size === 0) return '';
+    const parts = ['## Pinned Files (always in context)\n'];
+    for (const [filePath, content] of pinnedFiles) {
+      const ext = filePath.split('.').pop() || '';
+      parts.push(`### ${filePath}\n\`\`\`${ext}\n${content.slice(0, 8000)}\n\`\`\``);
+    }
+    return parts.join('\n\n');
+  };
+
   const getSystemPrompt = (): string => buildSystemPrompt(ctx, {
     profile: activeProfile,
-    systemOverride,
+    systemOverride: [systemOverride, getPinnedContext()].filter(Boolean).join('\n\n'),
   });
 
   printSessionHeader({ model, mode, provider, project: ctx.name, hasTridentMd: !!ctx.tridentMdContent, profile: activeProfile?.name });
@@ -674,6 +777,7 @@ async function runTrident(
   };
   const undoStack: UndoEntry[] = [];
   const taskHistory: Array<{ task: string; summary: string; cost: number }> = [];
+  const turnCostLog: Array<{ taskIdx: number; turn: number; cost: number }> = [];
   let lastTask: string | null = null;
 
   const handleSlash = async (raw: string): Promise<boolean> => {
@@ -701,7 +805,28 @@ async function runTrident(
         return true;
 
       case 'status':
-      case 'cost':
+      case 'cost': {
+        if (arg === 'breakdown' || arg === 'turns') {
+          if (turnCostLog.length === 0) {
+            printInfo('No turn cost data yet — run a task first.');
+            return true;
+          }
+          console.log('');
+          console.log('  ' + chalk.hex('#5EEAD4').bold('Cost breakdown by turn'));
+          let cumulative = 0;
+          for (const entry of turnCostLog) {
+            cumulative += entry.cost;
+            const taskLabel = chalk.dim(`task ${entry.taskIdx + 1}`);
+            const turnLabel = chalk.hex('#94A3B8')(`turn ${String(entry.turn).padStart(2)}`);
+            const costLabel = chalk.hex('#F5C97A')(`$${entry.cost.toFixed(5)}`);
+            const cumLabel = chalk.dim(`(Σ $${cumulative.toFixed(4)})`);
+            console.log(`    ${taskLabel}  ${turnLabel}  ${costLabel}  ${cumLabel}`);
+          }
+          console.log('');
+          console.log(`    Total: ${chalk.hex('#F5C97A')('$' + session.cost.toFixed(4))}`);
+          console.log('');
+          return true;
+        }
         printStatus({
           model: session.model,
           provider: session.provider,
@@ -713,8 +838,10 @@ async function runTrident(
           turns: session.turns,
           profile: session.profile,
           systemOverrideActive: session.systemOverride.trim().length > 0,
+          pinnedCount: pinnedFiles.size,
         });
         return true;
+      }
 
       case 'history': {
         if (taskHistory.length === 0) {
@@ -766,7 +893,11 @@ async function runTrident(
           session.tokens.input += result.totalTokens.input;
           session.tokens.output += result.totalTokens.output;
           session.turns += result.turns;
+          const retryTaskIdx = taskHistory.length;
           taskHistory.push({ task: lastTask, summary: result.summary, cost: result.totalCost });
+          for (const tc of result.turnCosts ?? []) {
+            turnCostLog.push({ taskIdx: retryTaskIdx, turn: tc.turn, cost: tc.cost });
+          }
         }
         return true;
       }
@@ -1068,10 +1199,58 @@ async function runTrident(
 
       case 'search': {
         if (!arg) {
-          printError('Usage: /search <query> [glob]');
+          printError('Usage: /search [--regex|-r] <query> [glob]');
           return true;
         }
-        const [searchQuery, searchGlob] = arg.split(/\s+(?=\*|\*\*|[a-zA-Z0-9_-]+[/*])/, 2);
+        const useRegex = arg.startsWith('--regex ') || arg.startsWith('-r ');
+        const argClean = useRegex ? arg.replace(/^(--regex|-r)\s+/, '') : arg;
+        const [searchQuery, searchGlob] = argClean.split(/\s+(?=\*|\*\*|[a-zA-Z0-9_-]+[/*])/, 2);
+
+        if (useRegex) {
+          let regex: RegExp;
+          try {
+            regex = new RegExp(searchQuery, 'gi');
+          } catch {
+            printError(`Invalid regex: ${searchQuery}`);
+            return true;
+          }
+          printInfo(`Regex search: /${searchQuery}/gi`);
+          const fg = (await import('fast-glob')).default;
+          const { readFile: rfSearch } = await import('fs/promises');
+          const { resolve: resolvePath } = await import('path');
+          const globPattern = searchGlob || '**/*.{ts,tsx,js,jsx,mjs,py,go,rs,java,rb,cs,cpp,c,h,md,json,yml,yaml}';
+          const files = await fg(globPattern, {
+            cwd, ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**'],
+            dot: false, absolute: false, followSymbolicLinks: false,
+          });
+          const hits: string[] = [];
+          for (const rel of files) {
+            let fc: string;
+            try { fc = await rfSearch(resolvePath(cwd, rel), 'utf-8'); } catch { continue; }
+            const lines = fc.split(/\r?\n/);
+            const matched: string[] = [];
+            for (let i = 0; i < lines.length; i++) {
+              regex.lastIndex = 0;
+              if (regex.test(lines[i])) matched.push(`  ${i + 1}: ${lines[i].slice(0, 200)}`);
+              if (matched.length >= 5) { matched.push('  …'); break; }
+            }
+            if (matched.length > 0) hits.push(`\n${rel}\n${matched.join('\n')}`);
+            if (hits.length >= 30) { hits.push('\n[truncated — too many matches]'); break; }
+          }
+          console.log('');
+          if (hits.length === 0) { printInfo(`No matches for /${searchQuery}/`); }
+          else {
+            for (const h of hits) {
+              for (const line of h.split('\n')) {
+                const isFile = line.trim() && !line.startsWith(' ') && !line.startsWith('[');
+                console.log('  ' + (isFile ? chalk.hex('#5EEAD4')(line) : chalk.hex('#94A3B8')(line)));
+              }
+            }
+          }
+          console.log('');
+          return true;
+        }
+
         printInfo(`Searching for "${searchQuery}"...`);
         const { executeTool: execTool } = await import('./agent/tools.js');
         const searchResult = await execTool(
@@ -1133,6 +1312,185 @@ async function runTrident(
         return true;
       }
 
+      // ── FEATURE: /pin, /unpin, /pinned ─────────────────────────────────
+      case 'pin': {
+        if (!arg) {
+          printError('Usage: /pin <file>');
+          return true;
+        }
+        let absPath: string;
+        try {
+          absPath = resolveWorkspacePath(cwd, arg);
+        } catch {
+          printError(`Path escapes workspace: ${arg}`);
+          return true;
+        }
+        let content: string;
+        try {
+          content = await fsReadFile(absPath, 'utf-8');
+        } catch {
+          printError(`Cannot read file: ${arg}`);
+          return true;
+        }
+        pinnedFiles.set(arg, content);
+        printSuccess(`Pinned ${arg} — always in context (${content.length.toLocaleString()} chars)`);
+        return true;
+      }
+
+      case 'unpin': {
+        if (!arg) {
+          if (pinnedFiles.size === 0) {
+            printInfo('No files are pinned.');
+          } else {
+            printError('Usage: /unpin <file>  (or /unpin all)');
+          }
+          return true;
+        }
+        if (/^(all|clear)$/i.test(arg)) {
+          pinnedFiles.clear();
+          printSuccess('All pinned files cleared.');
+          return true;
+        }
+        if (pinnedFiles.delete(arg)) {
+          printSuccess(`Unpinned ${arg}`);
+        } else {
+          printWarn(`"${arg}" was not pinned.`);
+        }
+        return true;
+      }
+
+      case 'pinned': {
+        if (pinnedFiles.size === 0) {
+          printInfo('No files are currently pinned.');
+        } else {
+          console.log('');
+          console.log('  ' + chalk.hex('#5EEAD4').bold('Pinned files'));
+          for (const [filePath, content] of pinnedFiles) {
+            console.log(`    ${chalk.white(filePath)} ${chalk.dim(`(${content.length.toLocaleString()} chars)`)}`);
+          }
+          console.log('');
+        }
+        return true;
+      }
+
+      // ── FEATURE: /snapshot ──────────────────────────────────────────────
+      case 'snapshot': {
+        const label = arg || `trident-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}`;
+        const isWin = process.platform === 'win32';
+        try {
+          const res = await execa(isWin ? 'cmd' : 'bash', [isWin ? '/c' : '-c', `git stash push -u -m "TRIDENT: ${label}"`], { cwd, reject: false, all: true });
+          const out = (typeof res.all === 'string' ? res.all : '').trim();
+          if ((res.exitCode ?? 1) === 0) {
+            printSuccess(`Snapshot created: "${label}"`);
+            if (out) console.log(chalk.dim('  ' + out));
+          } else {
+            printError(`Snapshot failed: ${out || 'git stash returned non-zero'}`);
+          }
+        } catch (err) {
+          printError(`Snapshot failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        return true;
+      }
+
+      // ── FEATURE: /resume ────────────────────────────────────────────────
+      case 'resume': {
+        const files = await getRecentSessionLogFiles(20);
+        if (files.length === 0) {
+          printInfo('No past sessions found.');
+          return true;
+        }
+        if (!arg) {
+          printError('Usage: /resume <n>  (number from /sessions list)');
+          return true;
+        }
+        const resumeNum = parseInt(arg, 10);
+        const targetFile = !Number.isNaN(resumeNum) && resumeNum > 0 && resumeNum <= files.length
+          ? files[resumeNum - 1]
+          : files.find((f) => f.includes(arg)) || null;
+        if (!targetFile) {
+          printError(`Session not found: ${arg}. Use /sessions to list available sessions.`);
+          return true;
+        }
+        const loaded = await loadLatestReviewableSession([targetFile]);
+        if (!loaded || loaded.entries.length === 0) {
+          printError('Session log is empty or unreadable.');
+          return true;
+        }
+        const toolSummary = loaded.entries
+          .map((e) => `  ${e.approved ? '✓' : '✗'} ${e.toolName}: ${JSON.stringify(e.input).slice(0, 60)}`)
+          .join('\n');
+        const contextBlock = `## Resumed from session ${targetFile.replace('.jsonl', '')}\n\nActions performed:\n${toolSummary}`;
+        systemOverride = [session.systemOverride, contextBlock].filter(Boolean).join('\n\n');
+        session.systemOverride = systemOverride;
+        printSuccess(`Resumed context from session ${resumeNum || arg} (${loaded.entries.length} actions).`);
+        printInfo('Next task will include that session as context.');
+        return true;
+      }
+
+      // ── FEATURE: /replay ────────────────────────────────────────────────
+      case 'replay': {
+        const files = await getRecentSessionLogFiles(20);
+        if (files.length === 0) {
+          printInfo('No past sessions found.');
+          return true;
+        }
+        if (!arg) {
+          printError('Usage: /replay <n>  (number from /sessions list)');
+          return true;
+        }
+        const replayNum = parseInt(arg, 10);
+        const replayFile = !Number.isNaN(replayNum) && replayNum > 0 && replayNum <= files.length
+          ? files[replayNum - 1]
+          : files.find((f) => f.includes(arg)) || null;
+        if (!replayFile) {
+          printError(`Session not found: ${arg}.`);
+          return true;
+        }
+        const replayLoaded = await loadLatestReviewableSession([replayFile]);
+        if (!replayLoaded || replayLoaded.entries.length === 0) {
+          printError('Session log is empty or unreadable.');
+          return true;
+        }
+        const replayableCalls = replayLoaded.entries.filter(
+          (e) => e.approved && e.toolName !== 'final_answer' && e.toolName !== 'ask_user',
+        );
+        if (replayableCalls.length === 0) {
+          printInfo('No replayable tool calls in this session.');
+          return true;
+        }
+        console.log('');
+        console.log('  ' + chalk.hex('#5EEAD4').bold('Tool calls to replay:'));
+        for (let i = 0; i < replayableCalls.length; i++) {
+          const e = replayableCalls[i];
+          console.log(`    ${chalk.dim(String(i + 1).padStart(2))}  ${chalk.white(e.toolName.padEnd(14))} ${chalk.dim(JSON.stringify(e.input).slice(0, 60))}`);
+        }
+        console.log('');
+        const { confirmed } = await inquirer.prompt([{
+          type: 'confirm', name: 'confirmed',
+          message: chalk.cyan(`Replay ${replayableCalls.length} action(s)?`),
+          default: false,
+        }]);
+        if (!confirmed) { printInfo('Replay cancelled.'); return true; }
+        const { executeTool: execToolReplay } = await import('./agent/tools.js');
+        let replayOk = 0; let replayFail = 0;
+        for (const e of replayableCalls) {
+          try {
+            const res = await execToolReplay(
+              { name: e.toolName as import('./agent/tools.js').ToolName, input: e.input },
+              cwd, askUserFn,
+            );
+            if (res.success) { printSuccess(`${e.toolName}: ${res.output.slice(0, 60)}`); replayOk++; }
+            else { printError(`${e.toolName}: ${res.error || 'failed'}`); replayFail++; }
+          } catch (err) {
+            printError(`${e.toolName}: ${err instanceof Error ? err.message : String(err)}`);
+            replayFail++;
+          }
+        }
+        console.log('');
+        printInfo(`Replay complete: ${replayOk} succeeded, ${replayFail} failed.`);
+        return true;
+      }
+
       default:
         printWarn(`Unknown command: /${head}. Type / then Enter for the menu, or /help for the list.`);
         return true;
@@ -1176,6 +1534,7 @@ async function runTrident(
       return;
     }
 
+    const taskIdx = taskHistory.length;
     const result = await executeTask(task, {
       model: session.model,
       mode: session.mode,
@@ -1197,6 +1556,9 @@ async function runTrident(
       session.tokens.output += result.totalTokens.output;
       session.turns += result.turns;
       taskHistory.push({ task, summary: result.summary, cost: result.totalCost });
+      for (const tc of result.turnCosts ?? []) {
+        turnCostLog.push({ taskIdx, turn: tc.turn, cost: tc.cost });
+      }
     }
   };
 
@@ -1261,6 +1623,7 @@ async function executeTask(
         turns: 1,
         totalCost: 0,
         totalTokens: { input: 0, output: 0 },
+        turnCosts: [],
       };
       printFinalSummary(result);
       if (!codexResult.success) {
@@ -1306,6 +1669,17 @@ async function executeTask(
       budgetUsd: opts.budgetUsd,
       logSessions: opts.logSessions,
       sessionId,
+      onTurnStart: process.stdout.isTTY
+        ? (turn, maxTurns) => {
+            const spinner = ora({ text: chalk.dim(`thinking · turn ${turn}/${maxTurns}`), color: 'cyan', discardStdin: false }).start();
+            return () => { spinner.stop(); process.stdout.write('\r\x1b[K'); };
+          }
+        : undefined,
+      onTurnComplete: (turn, turnCost) => {
+        if (process.stdout.isTTY) {
+          process.stdout.write(chalk.dim(`\n  ↳ turn ${turn} · $${turnCost.toFixed(5)}\n`));
+        }
+      },
       onText: printAgentText,
       onToolStart,
       beforeToolExecute,
