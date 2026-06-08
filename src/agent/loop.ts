@@ -4,12 +4,17 @@ import { execa } from 'execa';
 import { createDiffView } from '../ui/diff.js';
 import { streamCompletion, calculateCost } from '../providers/anthropic.js';
 import { streamOpenRouter, calculateOpenRouterCost } from '../providers/openrouter.js';
+import { streamVertex, calculateVertexCost } from '../providers/vertex.js';
+import { streamBedrock, calculateBedrockCost } from '../providers/bedrock.js';
 import { executeTool, TOOL_DEFINITIONS, resolveWorkspacePath, type ToolCall, type ToolResult } from './tools.js';
 import { classifyRisk, requestApproval, SessionLogger } from '../warden/index.js';
 import type { ChatMessage } from '../providers/anthropic.js';
 import type { ApprovalMode } from '../warden/index.js';
 
-export type ProviderName = 'anthropic' | 'openrouter';
+export type ProviderName = 'anthropic' | 'openrouter' | 'vertex' | 'bedrock';
+
+const READ_ONLY_TOOLS = new Set<string>(['read_file', 'list_dir', 'search_codebase']);
+const WRITE_TOOLS = new Set<string>(['write_file', 'edit_file']);
 
 export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   'claude-opus-4-7':           200000,
@@ -60,6 +65,8 @@ export interface AgentOptions {
   autoTest?: boolean;
   testCommand?: string;
   autoFormat?: boolean;
+  toolResultCaching?: boolean;
+  cacheTools?: boolean;
   askUserFn: (question: string) => Promise<string>;
 }
 
@@ -72,12 +79,24 @@ export interface AgentResult {
   turnCosts: Array<{ turn: number; cost: number }>;
 }
 
+function calcCost(provider: ProviderName, model: string, input: number, output: number): number {
+  switch (provider) {
+    case 'openrouter': return calculateOpenRouterCost(model, input, output);
+    case 'vertex':     return calculateVertexCost(model, input, output);
+    case 'bedrock':    return calculateBedrockCost(model, input, output);
+    default:           return calculateCost(model, input, output);
+  }
+}
+
 export async function runAgentLoop(
   initialTask: string,
   opts: AgentOptions
 ): Promise<AgentResult> {
   const logger = new SessionLogger(opts.sessionId, opts.logSessions);
   const messages: ChatMessage[] = [{ role: 'user', content: initialTask }];
+
+  const enableToolCache = opts.toolResultCaching !== false && opts.cacheTools !== false;
+  const toolCache = new Map<string, ToolResult>();
 
   let turns = 0;
   let totalInputTokens = 0;
@@ -86,7 +105,6 @@ export async function runAgentLoop(
   let finalAnswerFound = false;
   let budgetExceeded = false;
   let warnedMaxTurns = false;
-  const isOpenRouter = opts.provider === 'openrouter';
   const turnCostHistory: Array<{ turn: number; cost: number }> = [];
 
   while (turns < opts.maxTurns) {
@@ -120,15 +138,35 @@ export async function runAgentLoop(
       turnInputTokens = 0;
       turnOutputTokens = 0;
       try {
-        const stream = isOpenRouter
-          ? streamOpenRouter(messages, {
+        let stream: AsyncGenerator<import('../providers/anthropic.js').StreamChunk>;
+        switch (opts.provider) {
+          case 'openrouter':
+            stream = streamOpenRouter(messages, {
               model: opts.model,
               maxTokens: 8096,
               systemPrompt: opts.systemPrompt,
               tools: TOOL_DEFINITIONS,
               apiKey: process.env.OPENROUTER_API_KEY || '',
-            })
-          : streamCompletion(messages, {
+            });
+            break;
+          case 'vertex':
+            stream = streamVertex(messages, {
+              model: opts.model,
+              maxTokens: 8096,
+              systemPrompt: opts.systemPrompt,
+              tools: TOOL_DEFINITIONS,
+            });
+            break;
+          case 'bedrock':
+            stream = streamBedrock(messages, {
+              model: opts.model,
+              maxTokens: 8096,
+              systemPrompt: opts.systemPrompt,
+              tools: TOOL_DEFINITIONS,
+            });
+            break;
+          default:
+            stream = streamCompletion(messages, {
               model: opts.model,
               maxTokens: 8096,
               systemPrompt: opts.systemPrompt,
@@ -137,6 +175,7 @@ export async function runAgentLoop(
               thinkingBudget: opts.thinkingBudget,
               signal: opts.abortSignal,
             });
+        }
 
         for await (const chunk of stream) {
           if (opts.abortSignal?.aborted) {
@@ -159,14 +198,10 @@ export async function runAgentLoop(
 
         totalInputTokens += turnInputTokens;
         totalOutputTokens += turnOutputTokens;
-        const cost = isOpenRouter
-          ? calculateOpenRouterCost(opts.model, totalInputTokens, totalOutputTokens)
-          : calculateCost(opts.model, totalInputTokens, totalOutputTokens);
+        const cost = calcCost(opts.provider, opts.model, totalInputTokens, totalOutputTokens);
         opts.onCostUpdate?.(cost, { input: totalInputTokens, output: totalOutputTokens });
 
-        const turnCost = isOpenRouter
-          ? calculateOpenRouterCost(opts.model, turnInputTokens, turnOutputTokens)
-          : calculateCost(opts.model, turnInputTokens, turnOutputTokens);
+        const turnCost = calcCost(opts.provider, opts.model, turnInputTokens, turnOutputTokens);
         turnCostHistory.push({ turn: turns, cost: turnCost });
         opts.onTurnComplete?.(turns, turnCost, { input: turnInputTokens, output: turnOutputTokens });
         break;
@@ -180,9 +215,7 @@ export async function runAgentLoop(
             success: false,
             summary: finalSummary,
             turns,
-            totalCost: isOpenRouter
-              ? calculateOpenRouterCost(opts.model, totalInputTokens, totalOutputTokens)
-              : calculateCost(opts.model, totalInputTokens, totalOutputTokens),
+            totalCost: calcCost(opts.provider, opts.model, totalInputTokens, totalOutputTokens),
             totalTokens: { input: totalInputTokens, output: totalOutputTokens },
             turnCosts: turnCostHistory,
           };
@@ -230,9 +263,7 @@ export async function runAgentLoop(
       opts.onContextPressure?.();
     }
 
-    const runningCost = isOpenRouter
-      ? calculateOpenRouterCost(opts.model, totalInputTokens, totalOutputTokens)
-      : calculateCost(opts.model, totalInputTokens, totalOutputTokens);
+    const runningCost = calcCost(opts.provider, opts.model, totalInputTokens, totalOutputTokens);
     if (opts.budgetUsd !== undefined && runningCost >= opts.budgetUsd) {
       finalSummary = `Stopped after reaching the session budget of $${opts.budgetUsd.toFixed(2)}. Increase --budget or reduce scope to continue.`;
       budgetExceeded = true;
@@ -285,7 +316,32 @@ export async function runAgentLoop(
         await opts.beforeToolExecute(call);
       }
 
-      const result = await executeTool(call, opts.cwd, opts.askUserFn);
+      let result: ToolResult;
+      if (enableToolCache && READ_ONLY_TOOLS.has(call.name)) {
+        const cacheKey = `${call.name}:${JSON.stringify(call.input)}`;
+        const cached = toolCache.get(cacheKey);
+        if (cached) {
+          result = cached;
+        } else {
+          result = await executeTool(call, opts.cwd, opts.askUserFn);
+          if (result.success) toolCache.set(cacheKey, result);
+        }
+      } else {
+        result = await executeTool(call, opts.cwd, opts.askUserFn);
+        if (enableToolCache && WRITE_TOOLS.has(call.name)) {
+          const filePath = call.input.path as string | undefined;
+          if (filePath) {
+            for (const key of toolCache.keys()) {
+              if (key.startsWith('read_file:')) {
+                try {
+                  const keyInput = JSON.parse(key.slice('read_file:'.length)) as { path?: string };
+                  if (keyInput.path === filePath) toolCache.delete(key);
+                } catch { /* skip */ }
+              }
+            }
+          }
+        }
+      }
       opts.onToolEnd?.(call, result);
 
       await logger.log({ toolName: call.name, input: call.input, result, approved: true, riskLevel: risk });
@@ -331,9 +387,7 @@ export async function runAgentLoop(
     messages.push({ role: 'user', content: toolResults as unknown as ChatMessage['content'] });
   }
 
-  const totalCost = isOpenRouter
-    ? calculateOpenRouterCost(opts.model, totalInputTokens, totalOutputTokens)
-    : calculateCost(opts.model, totalInputTokens, totalOutputTokens);
+  const totalCost = calcCost(opts.provider, opts.model, totalInputTokens, totalOutputTokens);
 
   if (!finalAnswerFound && !budgetExceeded && turns >= opts.maxTurns) {
     finalSummary = `Stopped after ${turns} turns (max turn limit reached). The task may be incomplete - resume by re-running with a continuation prompt.`;
