@@ -134,7 +134,17 @@ export function printToolEnd(call: ToolCall, result: ToolResult): void {
 }
 
 function shouldShowOutput(call: ToolCall): boolean {
-  return call.name === 'read_file' || call.name === 'list_dir' || call.name === 'search_codebase' || call.name === 'run_command' || call.name === 'web_search' || call.name === 'github_api';
+  return call.name === 'read_file'
+    || call.name === 'list_dir'
+    || call.name === 'search_codebase'
+    || call.name === 'run_command'
+    || call.name === 'web_search'
+    || call.name === 'github_api'
+    || call.name === 'read_notebook'
+    || call.name === 'read_pdf'
+    || call.name === 'read_image'
+    || call.name === 'spawn_agent'
+    || call.name === 'edit_notebook_cell';
 }
 
 function firstLine(s: string, max: number): string {
@@ -396,7 +406,11 @@ function formatToolPreview(call: ToolCall): string {
     case 'write_file':
     case 'edit_file':
     case 'delete_file':
-    case 'git_blame': return call.input.path as string;
+    case 'git_blame':
+    case 'read_notebook':
+    case 'read_pdf':
+    case 'read_image': return call.input.path as string;
+    case 'edit_notebook_cell': return `${call.input.path as string} [cell ${call.input.cell_index}]`;
     case 'list_dir': return (call.input.path as string) + (call.input.recursive ? ' (recursive)' : '');
     case 'search_codebase':
     case 'web_search': return `"${truncate((call.input.query as string), 60)}"`;
@@ -405,6 +419,7 @@ function formatToolPreview(call: ToolCall): string {
     case 'memory_update': return truncate(call.input.fact as string, 60);
     case 'github_api': return `${call.input.method || 'GET'} ${truncate(call.input.endpoint as string, 60)}`;
     case 'final_answer': return '';
+    case 'spawn_agent': return `task: ${truncate(call.input.task as string, 60)}`;
     default: return '';
   }
 }

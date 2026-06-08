@@ -26,7 +26,12 @@ export type ToolName =
   | 'memory_update'
   | 'git_blame'
   | 'web_search'
-  | 'github_api';
+  | 'github_api'
+  | 'spawn_agent'
+  | 'read_notebook'
+  | 'edit_notebook_cell'
+  | 'read_pdf'
+  | 'read_image';
 
 export interface ToolCall {
   name: ToolName;
@@ -43,7 +48,8 @@ const TIMEOUT_MS = 30_000;
 export async function executeTool(
   call: ToolCall,
   cwd: string,
-  askUserFn: (q: string) => Promise<string>
+  askUserFn: (q: string) => Promise<string>,
+  spawnAgentFn?: (task: string, systemPrompt: string) => Promise<{ success: boolean; output: string }>
 ): Promise<ToolResult> {
   const start = Date.now();
 
@@ -374,6 +380,91 @@ export async function executeTool(
         return { success: true, output: text.slice(0, 16000), duration_ms: Date.now() - start };
       }
 
+      case 'spawn_agent': {
+        const { task, context } = call.input as { task: string; context?: string };
+        const systemPrompt = context || '';
+        if (!spawnAgentFn) {
+          return { success: false, output: '', error: 'spawn_agent not available in this context', duration_ms: Date.now() - start };
+        }
+        const result = await spawnAgentFn(task, systemPrompt);
+        return { success: result.success, output: result.output, duration_ms: Date.now() - start };
+      }
+
+      case 'read_notebook': {
+        const { path: filePath } = call.input as { path: string };
+        const absPath = resolveWorkspacePath(cwd, filePath);
+        if (!existsSync(absPath)) return { success: false, output: '', error: `File not found: ${absPath}`, duration_ms: Date.now() - start };
+        const raw = await readFile(absPath, 'utf-8');
+        let nb: any;
+        try { nb = JSON.parse(raw); } catch { return { success: false, output: '', error: 'Invalid notebook JSON', duration_ms: Date.now() - start }; }
+        const cells = nb.cells || [];
+        const lines: string[] = [`# Notebook: ${filePath} (${cells.length} cells)\n`];
+        for (let i = 0; i < cells.length; i++) {
+          const cell = cells[i];
+          const src = Array.isArray(cell.source) ? cell.source.join('') : cell.source || '';
+          lines.push(`## Cell ${i} [${cell.cell_type}]`);
+          lines.push(src);
+          const outputs = cell.outputs || [];
+          for (const out of outputs) {
+            if (out.output_type === 'stream') {
+              lines.push('Output: ' + (Array.isArray(out.text) ? out.text.join('') : out.text || ''));
+            } else if (out.output_type === 'error') {
+              lines.push('Error: ' + out.ename + ': ' + out.evalue);
+            } else if (out.data?.['text/plain']) {
+              lines.push('Result: ' + (Array.isArray(out.data['text/plain']) ? out.data['text/plain'].join('') : out.data['text/plain']));
+            }
+          }
+          lines.push('');
+        }
+        return { success: true, output: lines.join('\n').slice(0, 16000), duration_ms: Date.now() - start };
+      }
+
+      case 'edit_notebook_cell': {
+        const { path: filePath, cell_index, source } = call.input as { path: string; cell_index: number; source: string };
+        const absPath = resolveWorkspacePath(cwd, filePath);
+        if (!existsSync(absPath)) return { success: false, output: '', error: `File not found: ${absPath}`, duration_ms: Date.now() - start };
+        const raw = await readFile(absPath, 'utf-8');
+        let nb: any;
+        try { nb = JSON.parse(raw); } catch { return { success: false, output: '', error: 'Invalid notebook JSON', duration_ms: Date.now() - start }; }
+        if (!nb.cells || cell_index < 0 || cell_index >= nb.cells.length) {
+          return { success: false, output: '', error: `Cell index ${cell_index} out of range (0-${(nb.cells?.length || 1) - 1})`, duration_ms: Date.now() - start };
+        }
+        nb.cells[cell_index].source = source.split('\n').map((l: string, i: number, arr: string[]) => i < arr.length - 1 ? l + '\n' : l);
+        await writeFile(absPath, JSON.stringify(nb, null, 1), 'utf-8');
+        return { success: true, output: `Cell ${cell_index} updated in ${relative(cwd, absPath)}`, duration_ms: Date.now() - start };
+      }
+
+      case 'read_pdf': {
+        const { path: filePath, pages } = call.input as { path: string; pages?: string };
+        const absPath = resolveWorkspacePath(cwd, filePath);
+        if (!existsSync(absPath)) return { success: false, output: '', error: `File not found: ${absPath}`, duration_ms: Date.now() - start };
+        const pageFlag = pages ? `-f ${pages.split('-')[0] || 1} -l ${pages.split('-')[1] || 999}` : '';
+        const isWin = process.platform === 'win32';
+        const res = await execa(isWin ? 'cmd' : 'bash', [isWin ? '/c' : '-c', `pdftotext ${pageFlag} "${absPath}" -`], { reject: false, all: true, timeout: 30000 });
+        const out = typeof res.all === 'string' ? res.all : '';
+        if (res.exitCode !== 0) {
+          if (out.includes('command not found') || res.exitCode === 127) {
+            return { success: false, output: '', error: 'pdftotext not found. Install poppler-utils: apt install poppler-utils / brew install poppler', duration_ms: Date.now() - start };
+          }
+          return { success: false, output: out.slice(0, 2000), error: `pdftotext failed (exit ${res.exitCode})`, duration_ms: Date.now() - start };
+        }
+        return { success: true, output: out.slice(0, 32000), duration_ms: Date.now() - start };
+      }
+
+      case 'read_image': {
+        const { path: filePath } = call.input as { path: string };
+        const absPath = resolveWorkspacePath(cwd, filePath);
+        if (!existsSync(absPath)) return { success: false, output: '', error: `File not found: ${absPath}`, duration_ms: Date.now() - start };
+        const ext = filePath.split('.').pop()?.toLowerCase() || '';
+        const mediaTypeMap: Record<string, string> = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
+        const mediaType = mediaTypeMap[ext];
+        if (!mediaType) return { success: false, output: '', error: `Unsupported image format: .${ext}. Supported: jpg, png, gif, webp`, duration_ms: Date.now() - start };
+        const bytes = await readFile(absPath);
+        const b64 = bytes.toString('base64');
+        // Return as a special marker that loop.ts can detect for vision injection
+        return { success: true, output: `__IMAGE_BLOCK__:${mediaType}:${b64}`, duration_ms: Date.now() - start };
+      }
+
       default:
         return { success: false, output: '', error: `Unknown tool: ${(call as ToolCall).name}`, duration_ms: Date.now() - start };
     }
@@ -563,6 +654,61 @@ export const TOOL_DEFINITIONS = [
         path: { type: 'string', description: 'API path e.g. /repos/owner/repo/issues or full URL' },
         body: { type: 'object', description: 'Request body for POST/PATCH' },
       },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'spawn_agent',
+    description: 'Spawn a sub-agent to handle a focused sub-task in isolation and return its output. Use for parallelizable work or tasks that need a clean context.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: 'The task for the sub-agent' },
+        context: { type: 'string', description: 'Optional extra context/instructions for the sub-agent' },
+      },
+      required: ['task'],
+    },
+  },
+  {
+    name: 'read_notebook',
+    description: 'Read and render a Jupyter notebook (.ipynb) showing all cells and outputs',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'Path to the .ipynb file' } },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'edit_notebook_cell',
+    description: 'Edit a specific cell in a Jupyter notebook by index (0-based)',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Path to the .ipynb file' },
+        cell_index: { type: 'number', description: 'Zero-based index of the cell to edit' },
+        source: { type: 'string', description: 'New source content for the cell' },
+      },
+      required: ['path', 'cell_index', 'source'],
+    },
+  },
+  {
+    name: 'read_pdf',
+    description: "Extract text from a PDF file using pdftotext. Optional pages range e.g. '1-5'",
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Path to the PDF file' },
+        pages: { type: 'string', description: "Optional page range e.g. '1-5'" },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'read_image',
+    description: 'Read an image file (jpg, png, gif, webp) and make it visible to the AI for visual analysis',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'Path to the image file' } },
       required: ['path'],
     },
   },

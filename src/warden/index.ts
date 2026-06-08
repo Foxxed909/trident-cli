@@ -20,6 +20,49 @@ export interface ActionLog {
   riskLevel: RiskLevel;
 }
 
+export interface PermitRule {
+  tool: string;           // tool name or '*' for any
+  pattern?: string;       // regex to match against the serialized input
+  description?: string;   // human-readable label
+}
+
+export async function loadPermitRules(): Promise<PermitRule[]> {
+  const { homedir } = await import('os');
+  const { readFile } = await import('fs/promises');
+  const { join } = await import('path');
+  const { existsSync } = await import('fs');
+  const path = join(homedir(), '.trident', 'allow.json');
+  if (!existsSync(path)) return [];
+  try {
+    return JSON.parse(await readFile(path, 'utf-8')) as PermitRule[];
+  } catch { return []; }
+}
+
+export async function savePermitRule(rule: PermitRule): Promise<void> {
+  const { homedir } = await import('os');
+  const { readFile, writeFile, mkdir } = await import('fs/promises');
+  const { join } = await import('path');
+  const dir = join(homedir(), '.trident');
+  const path = join(dir, 'allow.json');
+  await mkdir(dir, { recursive: true });
+  let rules: PermitRule[] = [];
+  try { rules = JSON.parse(await readFile(path, 'utf-8')); } catch {}
+  rules.push(rule);
+  await writeFile(path, JSON.stringify(rules, null, 2), 'utf-8');
+}
+
+export function matchesPermitRule(call: ToolCall, rules: PermitRule[]): boolean {
+  const inputStr = JSON.stringify(call.input);
+  for (const rule of rules) {
+    if (rule.tool !== '*' && rule.tool !== call.name) continue;
+    if (!rule.pattern) return true;
+    try {
+      if (new RegExp(rule.pattern).test(inputStr)) return true;
+    } catch {}
+  }
+  return false;
+}
+
 export function classifyRisk(call: ToolCall): RiskLevel {
   switch (call.name) {
     case 'read_file':
@@ -30,11 +73,15 @@ export function classifyRisk(call: ToolCall): RiskLevel {
     case 'git_blame':
     case 'ask_user':
     case 'final_answer':
+    case 'read_notebook':
+    case 'read_pdf':
+    case 'read_image':
       return 'read';
 
     case 'write_file':
     case 'edit_file':
     case 'memory_update':
+    case 'edit_notebook_cell':
       return 'write';
 
     case 'github_api':
@@ -50,6 +97,9 @@ export function classifyRisk(call: ToolCall): RiskLevel {
 
     case 'delete_file':
       return 'destructive';
+
+    case 'spawn_agent':
+      return 'execute';
 
     default:
       return 'execute';
@@ -77,9 +127,13 @@ export function getRiskEmoji(level: RiskLevel): string {
 export async function requestApproval(
   call: ToolCall,
   mode: ApprovalMode,
-  risk: RiskLevel
+  risk: RiskLevel,
+  permitRules?: PermitRule[]
 ): Promise<boolean> {
-  if (mode === 'yolo') {
+  if (mode === 'yolo') return true;
+
+  if (permitRules && permitRules.length > 0 && matchesPermitRule(call, permitRules)) {
+    console.log(chalk.dim(`  [permit] auto-approved ${call.name} (matched allow rule)`));
     return true;
   }
 
@@ -136,13 +190,19 @@ function formatInputPreview(call: ToolCall): string {
     case 'delete_file':
     case 'read_file':
     case 'git_blame':
+    case 'read_notebook':
+    case 'edit_notebook_cell':
+    case 'read_pdf':
+    case 'read_image':
       return `  file ${chalk.cyan(call.input.path as string)}`;
     case 'memory_update':
       return `  fact: ${chalk.cyan(String(call.input.fact || '').slice(0, 60))}`;
     case 'web_search':
       return `  query: ${chalk.cyan(String(call.input.query || '').slice(0, 60))}`;
     case 'github_api':
-      return `  ${call.input.method || 'GET'} ${chalk.cyan(String(call.input.endpoint || '').slice(0, 60))}`;
+      return `  ${call.input.method || 'GET'} ${chalk.cyan(String(call.input.endpoint || call.input.path || '').slice(0, 60))}`;
+    case 'spawn_agent':
+      return `  task: ${chalk.cyan((call.input.task as string || '').slice(0, 80))}`;
     default:
       return '';
   }

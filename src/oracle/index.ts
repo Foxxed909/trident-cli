@@ -48,9 +48,12 @@ export interface ProjectContext {
   tree: string;
   tridentMdPath: string;
   tridentMdContent: string | null;
+  globalTridentMdPath: string;
 }
 
 const TRIDENT_MD_FILENAME = 'TRIDENT.md';
+
+export const globalTridentMdPath = join(homedir(), '.trident', 'TRIDENT.md');
 
 export async function loadOrCreateContext(cwd: string): Promise<ProjectContext> {
   const tridentMdPath = join(cwd, TRIDENT_MD_FILENAME);
@@ -59,6 +62,18 @@ export async function loadOrCreateContext(cwd: string): Promise<ProjectContext> 
   if (existsSync(tridentMdPath)) {
     tridentMdContent = await readFile(tridentMdPath, 'utf-8');
   }
+
+  // Load global TRIDENT.md from ~/.trident/TRIDENT.md
+  let globalTridentContent: string | null = null;
+  if (existsSync(globalTridentMdPath)) {
+    globalTridentContent = await readFile(globalTridentMdPath, 'utf-8');
+  }
+
+  // Merge: global first, then project-specific overrides
+  const mergedContent = [
+    globalTridentContent ? `<!-- global ~/.trident/TRIDENT.md -->\n${globalTridentContent}` : null,
+    tridentMdContent,
+  ].filter(Boolean).join('\n\n---\n\n') || null;
 
   const name = await detectProjectName(cwd);
   const languages = await detectLanguages(cwd);
@@ -76,7 +91,8 @@ export async function loadOrCreateContext(cwd: string): Promise<ProjectContext> 
     commands,
     tree,
     tridentMdPath,
-    tridentMdContent,
+    tridentMdContent: mergedContent,
+    globalTridentMdPath,
   };
 }
 
