@@ -317,6 +317,24 @@ export async function runAgentLoop(
         await opts.beforeToolExecute(call);
       }
 
+      // Callback that spawn_agent tool uses to run a sub-agent loop
+      const spawnAgentFn = async (task: string, systemPrompt: string): Promise<{ success: boolean; output: string }> => {
+        let output = '';
+        const subResult = await runAgentLoop(task, {
+          ...opts,
+          systemPrompt: systemPrompt || opts.systemPrompt,
+          maxTurns: Math.min(opts.maxTurns, 20),
+          onText: (t) => { output += t; },
+          onToolStart: undefined,
+          onToolEnd: undefined,
+          onTurnStart: undefined,
+          onTurnComplete: undefined,
+          onContextPressure: undefined,
+          onCostUpdate: undefined,
+        });
+        return { success: subResult.success, output: output || subResult.summary };
+      };
+
       let result: ToolResult;
       if (enableToolCache && READ_ONLY_TOOLS.has(call.name)) {
         const cacheKey = `${call.name}:${JSON.stringify(call.input)}`;
@@ -324,11 +342,11 @@ export async function runAgentLoop(
         if (cached) {
           result = cached;
         } else {
-          result = await executeTool(call, opts.cwd, opts.askUserFn);
+          result = await executeTool(call, opts.cwd, opts.askUserFn, spawnAgentFn);
           if (result.success) toolCache.set(cacheKey, result);
         }
       } else {
-        result = await executeTool(call, opts.cwd, opts.askUserFn);
+        result = await executeTool(call, opts.cwd, opts.askUserFn, spawnAgentFn);
         if (enableToolCache && WRITE_TOOLS.has(call.name)) {
           const filePath = call.input.path as string | undefined;
           if (filePath) {
@@ -377,6 +395,26 @@ export async function runAgentLoop(
       const messageContent = isAmbiguousEdit
         ? `${baseContent}\n\nHINT: Retry edit_file with a more specific old_str — include additional surrounding lines above and below the target so the match is unique.`
         : baseContent;
+
+      // Handle vision image blocks from read_image tool
+      const IMAGE_PREFIX = '__IMAGE_BLOCK__:';
+      if (result.success && messageContent.startsWith(IMAGE_PREFIX)) {
+        const rest = messageContent.slice(IMAGE_PREFIX.length);
+        const colonIdx = rest.indexOf(':');
+        if (colonIdx !== -1) {
+          const mediaType = rest.slice(0, colonIdx) as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+          const data = rest.slice(colonIdx + 1);
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: tc.id,
+            content: [
+              { type: 'text', text: 'Image loaded.' },
+              { type: 'image', source: { type: 'base64', media_type: mediaType, data } },
+            ] as unknown as string,
+          });
+          continue;
+        }
+      }
 
       toolResults.push({
         type: 'tool_result',
