@@ -12,6 +12,7 @@ const CLI_PATH = path.join(__dirname, '..', 'dist', 'index.js');
 let mainWindow = null;
 let tray = null;
 let currentTask = null; // { process, abortController }
+let currentCwd = process.cwd(); // tracks the user's project directory
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -126,9 +127,12 @@ ipcMain.handle('run-task', async (event, task, opts = {}) => {
   if (opts.mode) env.TRIDENT_MODE = opts.mode;
   if (opts.cwd) env.TRIDENT_CWD = opts.cwd;
 
+  const spawnCwd = opts.cwd || process.cwd();
+  if (opts.cwd) currentCwd = opts.cwd;
+
   const child = spawn('node', args, {
     env,
-    cwd: opts.cwd || process.cwd(),
+    cwd: spawnCwd,
   });
 
   currentTask = { process: child };
@@ -246,7 +250,7 @@ ipcMain.handle('set-config', async (_, cfg) => {
 
 ipcMain.handle('list-sessions', async () => {
   try {
-    const logsDir = path.join(os.homedir(), '.trident', 'sessions');
+    const logsDir = path.join(os.homedir(), '.trident', 'logs');
     if (!fs.existsSync(logsDir)) return [];
     const files = fs.readdirSync(logsDir)
       .filter(f => f.endsWith('.json') || f.endsWith('.log'))
@@ -277,7 +281,7 @@ ipcMain.handle('list-sessions', async () => {
 
 ipcMain.handle('get-memory', async () => {
   try {
-    const memPath = path.join(process.cwd(), 'TRIDENT.md');
+    const memPath = path.join(currentCwd, 'TRIDENT.md');
     if (!fs.existsSync(memPath)) return '';
     return fs.readFileSync(memPath, 'utf8');
   } catch {
@@ -287,7 +291,7 @@ ipcMain.handle('get-memory', async () => {
 
 ipcMain.handle('set-memory', async (_, content) => {
   try {
-    const memPath = path.join(process.cwd(), 'TRIDENT.md');
+    const memPath = path.join(currentCwd, 'TRIDENT.md');
     fs.writeFileSync(memPath, content, 'utf8');
     return { ok: true };
   } catch (e) {
@@ -297,11 +301,12 @@ ipcMain.handle('set-memory', async (_, content) => {
 
 ipcMain.handle('list-models', async () => {
   return [
+    { id: 'claude-opus-4-8', name: 'Claude Opus 4.8', provider: 'anthropic' },
     { id: 'claude-opus-4-7', name: 'Claude Opus 4.7', provider: 'anthropic' },
-    { id: 'claude-opus-4-5', name: 'Claude Opus 4.5', provider: 'anthropic' },
-    { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', provider: 'anthropic' },
-    { id: 'claude-sonnet-4-5', name: 'Claude Sonnet 4.5', provider: 'anthropic' },
+    { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6 (default)', provider: 'anthropic' },
     { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5', provider: 'anthropic' },
+    { id: 'anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4.6', provider: 'openrouter' },
+    { id: 'openai/gpt-oss-120b:free', name: 'GPT OSS 120B (free)', provider: 'openrouter' },
     { id: 'openai/gpt-4o', name: 'GPT-4o', provider: 'openrouter' },
     { id: 'openai/gpt-4-turbo', name: 'GPT-4 Turbo', provider: 'openrouter' },
     { id: 'google/gemini-pro-1.5', name: 'Gemini Pro 1.5', provider: 'openrouter' },
@@ -364,4 +369,4 @@ ipcMain.handle('show-notification', async (_, { title, body }) => {
   }
 });
 
-ipcMain.handle('get-cwd', async () => process.cwd());
+ipcMain.handle('get-cwd', async () => currentCwd);
