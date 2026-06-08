@@ -134,6 +134,7 @@ export async function* streamOpenRouter(
 
   const resp = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
     method: 'POST',
+    signal: AbortSignal.timeout(120_000),
     headers: {
       'Authorization': `Bearer ${opts.apiKey}`,
       'Content-Type': 'application/json',

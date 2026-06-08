@@ -1160,15 +1160,20 @@ async function runTrident(
           const historyText = taskHistory.map((h, i) =>
             `Task ${i + 1}: ${h.task}\nResult: ${h.summary}`
           ).join('\n\n');
-          const { streamCompletion: sc } = await import('./providers/anthropic.js');
-          const { streamOpenRouter: sor } = await import('./providers/openrouter.js');
           const compactMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [{
             role: 'user',
             content: `Summarise the following session history into a concise paragraph that captures key outcomes, files changed, and important context. Write in plain prose, no bullet points.\n\n${historyText}`,
           }];
-          const compactStream = session.provider === 'openrouter'
-            ? sor(compactMessages as never, { model: session.model, maxTokens: 512, systemPrompt: 'You are a concise summariser.', tools: [], apiKey: process.env.OPENROUTER_API_KEY || '' })
-            : sc(compactMessages as never, { model: session.model, maxTokens: 512, systemPrompt: 'You are a concise summariser.', tools: [] });
+          const compactOpts = { model: session.model, maxTokens: 512, systemPrompt: 'You are a concise summariser.', tools: [] };
+          const { streamCompletion: sc } = await import('./providers/anthropic.js');
+          const { streamOpenRouter: sor } = await import('./providers/openrouter.js');
+          const { streamVertex: sv } = await import('./providers/vertex.js');
+          const { streamBedrock: sb } = await import('./providers/bedrock.js');
+          const compactStream =
+            session.provider === 'openrouter' ? sor(compactMessages as never, { ...compactOpts, apiKey: process.env.OPENROUTER_API_KEY || '' })
+            : session.provider === 'vertex' ? sv(compactMessages as never, compactOpts)
+            : session.provider === 'bedrock' ? sb(compactMessages as never, compactOpts)
+            : sc(compactMessages as never, compactOpts);
           let summary = '';
           for await (const chunk of compactStream) {
             if (chunk.type === 'text' && chunk.text) summary += chunk.text;
