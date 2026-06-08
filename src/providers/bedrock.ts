@@ -294,6 +294,7 @@ export async function* streamBedrock(
 
   const resp = await fetch(url, {
     method: 'POST',
+    signal: AbortSignal.timeout(120_000),
     headers: {
       ...sigHeaders,
       'Content-Type': 'application/json',

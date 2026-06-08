@@ -28,9 +28,11 @@ function mapToVertexModelId(model: string): string {
   if (model.startsWith('claude-') && model.includes('@')) return model;
   // Map common shorthand names to Vertex versioned IDs
   const vertexModelMap: Record<string, string> = {
+    'claude-opus-4-8':           'claude-opus-4-8@20260601',
+    'claude-opus-4-7':           'claude-opus-4-7@20260401',
     'claude-opus-4-5':           'claude-opus-4-5@20251101',
-    'claude-sonnet-4-5':         'claude-sonnet-4-5@20251001',
     'claude-sonnet-4-6':         'claude-sonnet-4-6@20260101',
+    'claude-sonnet-4-5':         'claude-sonnet-4-5@20251001',
     'claude-haiku-4-5-20251001': 'claude-haiku-4-5@20251001',
   };
   return vertexModelMap[model] ?? model;
@@ -65,6 +67,7 @@ export async function* streamVertex(
 
   const resp = await fetch(endpoint, {
     method: 'POST',
+    signal: AbortSignal.timeout(120_000),
     headers: {
       'Authorization': `Bearer ${accessToken}`,
       'Content-Type': 'application/json',
