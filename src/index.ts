@@ -132,14 +132,25 @@ program
     let cfg: TridentConfig;
     try { cfg = getConfig(); } catch { cfg = getDefaultConfig() as TridentConfig; }
 
-    const provider = resolveProvider(opts.provider, cfg.provider) as 'anthropic' | 'openrouter';
+    const provider = resolveProvider(opts.provider, cfg.provider);
     const model = opts.model || cfg.model;
 
-    const envKey = provider === 'openrouter' ? 'OPENROUTER_API_KEY' : 'ANTHROPIC_API_KEY';
-    if (!process.env[envKey]) {
-      printError(`${envKey} is not set.`);
-      process.exit(1);
-      return;
+    if (provider === 'vertex') {
+      if (!process.env.GOOGLE_CLOUD_PROJECT || !process.env.VERTEX_AI_ACCESS_TOKEN) {
+        printError('Vertex AI requires GOOGLE_CLOUD_PROJECT and VERTEX_AI_ACCESS_TOKEN env vars.');
+        process.exit(1); return;
+      }
+    } else if (provider === 'bedrock') {
+      if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+        printError('Bedrock requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY env vars.');
+        process.exit(1); return;
+      }
+    } else {
+      const envKey = provider === 'openrouter' ? 'OPENROUTER_API_KEY' : 'ANTHROPIC_API_KEY';
+      if (!process.env[envKey]) {
+        printError(`${envKey} is not set.`);
+        process.exit(1); return;
+      }
     }
 
     const reviewPrompt = `You are an expert code reviewer. Analyse the following file and produce a structured review.
@@ -167,6 +178,8 @@ Prioritised action items to improve the file.`;
 
     const { streamCompletion: sc } = await import('./providers/anthropic.js');
     const { streamOpenRouter: sor } = await import('./providers/openrouter.js');
+    const { streamVertex: sv } = await import('./providers/vertex.js');
+    const { streamBedrock: sb } = await import('./providers/bedrock.js');
 
     console.log('');
     console.log('  ' + chalk.hex('#5EEAD4').bold('> CODE REVIEW') + '  ' + chalk.dim(file));
@@ -176,9 +189,12 @@ Prioritised action items to improve the file.`;
     let firstToken = true;
 
     const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [{ role: 'user', content: reviewPrompt }];
+    const reviewOpts = { model, maxTokens: 4096, systemPrompt: 'You are an expert code reviewer.', tools: [] };
     const stream = provider === 'openrouter'
-      ? sor(messages as never, { model, maxTokens: 4096, systemPrompt: 'You are an expert code reviewer.', tools: [], apiKey: process.env.OPENROUTER_API_KEY || '' })
-      : sc(messages as never, { model, maxTokens: 4096, systemPrompt: 'You are an expert code reviewer.', tools: [] });
+      ? sor(messages as never, { ...reviewOpts, apiKey: process.env.OPENROUTER_API_KEY || '' })
+      : provider === 'vertex' ? sv(messages as never, reviewOpts)
+      : provider === 'bedrock' ? sb(messages as never, reviewOpts)
+      : sc(messages as never, reviewOpts);
 
     for await (const chunk of stream) {
       if (chunk.type === 'text' && chunk.text) {
@@ -2034,7 +2050,10 @@ async function runTrident(
           const prState = await fetchPRState(prOwner, prRepo, prNumber, ghToken);
           printInfo(`Watching PR #${prNumber}: ${prState.title} [${prState.state}]`);
           printInfo(`CI: ${prState.ciStatus}  |  Comments: ${prState.commentCount}  |  Mergeable: ${prState.mergeable ?? 'unknown'}`);
+          let prPollActive = false;
           const prIntervalHandle = setInterval(async () => {
+            if (prPollActive) return; // skip if previous poll still running
+            prPollActive = true;
             try {
               const newPrState = await fetchPRState(prOwner, prRepo, prNumber, ghToken);
               const watcher = prWatchers.find(w => w.owner === prOwner && w.repo === prRepo && w.prNumber === prNumber);
@@ -2049,6 +2068,8 @@ async function runTrident(
               }
             } catch {
               // ignore polling errors
+            } finally {
+              prPollActive = false;
             }
           }, 60000);
           const prWatcher: PRWatcher = {

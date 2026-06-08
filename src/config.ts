@@ -53,7 +53,13 @@ export function deleteConfig(key: keyof TridentConfig): void {
 
 export function getRawConfig(): RawConfig {
   migrateLegacyConfigKeys();
-  return { ...store.store };
+  // Strip null values — the desktop app writes `null` for optional fields but
+  // Zod's .optional() only accepts undefined, not null.
+  const raw = { ...store.store };
+  for (const [key, val] of Object.entries(raw)) {
+    if (val === null) delete raw[key];
+  }
+  return raw;
 }
 
 export function getDefaultConfig(): TridentConfig {
