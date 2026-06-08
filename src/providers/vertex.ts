@@ -176,9 +176,11 @@ export async function* streamVertex(
 
 // Vertex AI uses same pricing as Anthropic direct (pass-through)
 const VERTEX_PRICING: Record<string, { input: number; output: number }> = {
+  'claude-opus-4-8':           { input: 15,   output: 75   },
+  'claude-opus-4-7':           { input: 15,   output: 75   },
   'claude-opus-4-5':           { input: 15,   output: 75   },
-  'claude-sonnet-4-5':         { input: 3,    output: 15   },
   'claude-sonnet-4-6':         { input: 3,    output: 15   },
+  'claude-sonnet-4-5':         { input: 3,    output: 15   },
   'claude-haiku-4-5-20251001': { input: 0.25, output: 1.25 },
 };
 

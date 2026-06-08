@@ -369,9 +369,11 @@ export async function executeTool(
         const { path: filePath, startLine, endLine } = call.input as { path: string; startLine?: number; endLine?: number };
         const absPath = resolveWorkspacePath(cwd, filePath);
         if (!existsSync(absPath)) return { success: false, output: '', error: `File not found: ${absPath}`, duration_ms: Date.now() - start };
-        const lineFlag = (startLine && endLine) ? ` -L ${startLine},${endLine}` : '';
         const isWindows = process.platform === 'win32';
-        const execRes = await execa(isWindows ? 'cmd' : 'bash', [isWindows ? '/c' : '-c', `git blame --porcelain${lineFlag} -- "${filePath}"`], { cwd, reject: false, all: true, timeout: 10000 });
+        // On Unix use execa's arg array to avoid path injection via file names containing quotes
+        const execRes = isWindows
+          ? await execa('cmd', ['/c', `git blame --porcelain${(startLine && endLine) ? ` -L ${startLine},${endLine}` : ''} -- "${filePath}"`], { cwd, reject: false, all: true, timeout: 10000 })
+          : await execa('git', ['blame', '--porcelain', ...(startLine && endLine ? ['-L', `${startLine},${endLine}`] : []), '--', filePath], { cwd, reject: false, all: true, timeout: 10000 });
         const blameOut = typeof execRes.all === 'string' ? execRes.all : '';
         if (execRes.exitCode !== 0) return { success: false, output: '', error: blameOut.slice(0, 500) || 'git blame failed', duration_ms: Date.now() - start };
         const blameLines = blameOut.split('\n');

@@ -17,6 +17,7 @@ const READ_ONLY_TOOLS = new Set<string>(['read_file', 'list_dir', 'search_codeba
 const WRITE_TOOLS = new Set<string>(['write_file', 'edit_file']);
 
 export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
+  'claude-opus-4-8':           200000,
   'claude-opus-4-7':           200000,
   'claude-opus-4-5':           200000,
   'claude-sonnet-4-6':         200000,
@@ -58,7 +59,7 @@ export interface AgentOptions {
   onToolStart?: (call: ToolCall) => void | Promise<void>;
   beforeToolExecute?: (call: ToolCall) => void | Promise<void>;
   onToolEnd?: (call: ToolCall, result: ToolResult) => void;
-  onCostUpdate?: (totalCost: number, tokens: { input: number; output: number }) => void;
+  onCostUpdate?: (totalCost: number, tokens: { input: number; output: number }, contextTokens?: number) => void;
   onTurnComplete?: (turn: number, turnCost: number, turnTokens: { input: number; output: number }) => void;
   onTurnStart?: (turn: number, maxTurns: number) => (() => void) | void;
   onContextPressure?: () => void;
@@ -224,7 +225,10 @@ export async function runAgentLoop(
         totalInputTokens += turnInputTokens;
         totalOutputTokens += turnOutputTokens;
         const cost = calcCost(opts.provider, opts.model, totalInputTokens, totalOutputTokens);
-        opts.onCostUpdate?.(cost, { input: totalInputTokens, output: totalOutputTokens });
+        // Pass turnInputTokens as contextTokens: each API call includes the full conversation
+        // history in its input, so the latest turn's input tokens = current context window usage.
+        // totalInputTokens is the billing sum across all calls, not the window size.
+        opts.onCostUpdate?.(cost, { input: totalInputTokens, output: totalOutputTokens }, turnInputTokens);
 
         const turnCost = calcCost(opts.provider, opts.model, turnInputTokens, turnOutputTokens);
         turnCostHistory.push({ turn: turns, cost: turnCost });
@@ -283,9 +287,10 @@ export async function runAgentLoop(
       warnedMaxTurns = true;
     }
 
-    // Context window pressure is measured by input tokens only — output tokens
-    // are not part of the context window; only the prompt (input) consumes it.
-    const contextPct = Math.round((totalInputTokens / getContextLimit(opts.model)) * 100);
+    // Context window pressure: use turnInputTokens (latest call's input), not totalInputTokens.
+    // Each API call sends the entire conversation history, so the latest turn's input token
+    // count represents the actual current context window occupancy.
+    const contextPct = Math.round((turnInputTokens / getContextLimit(opts.model)) * 100);
     if (contextPct >= 80 && !warnedContextPressure) {
       warnedContextPressure = true;
       opts.onContextPressure?.();
@@ -416,7 +421,13 @@ export async function runAgentLoop(
         const fmtCmd = FORMATTERS[ext];
         if (fmtCmd) {
           const isWin = process.platform === 'win32';
-          await execa(isWin ? 'cmd' : 'bash', [isWin ? '/c' : '-c', `${fmtCmd} "${filePath}"`], { cwd: opts.cwd, reject: false, timeout: 15000 }).catch(() => {});
+          if (isWin) {
+            await execa('cmd', ['/c', `${fmtCmd} "${filePath}"`], { cwd: opts.cwd, reject: false, timeout: 15000 }).catch(() => {});
+          } else {
+            // Use execa's arg array (not a shell string) to avoid path injection
+            const [fmtExe, ...fmtArgs] = fmtCmd.split(' ');
+            await execa(fmtExe, [...fmtArgs, filePath], { cwd: opts.cwd, reject: false, timeout: 15000 }).catch(() => {});
+          }
           baseContent += '\n[auto-formatted]';
         }
       }

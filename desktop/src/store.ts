@@ -146,8 +146,22 @@ export const useStore = create<AppStore>((set, get) => ({
     const { sessions, activeSessionId } = get();
     if (sessions.length <= 1) return;
     const filtered = sessions.filter(s => s.id !== id);
-    const newActive = activeSessionId === id ? filtered[filtered.length - 1].id : activeSessionId;
-    set({ sessions: filtered, activeSessionId: newActive });
+    const newActiveId = activeSessionId === id ? filtered[filtered.length - 1].id : activeSessionId;
+    if (activeSessionId === id) {
+      // Active session closed — restore stats for the newly-active session
+      const sess = filtered.find(s => s.id === newActiveId)!;
+      set({
+        sessions: filtered,
+        activeSessionId: newActiveId,
+        isRunning: sess.isRunning || false,
+        totalCost: sess.totalCost,
+        totalTokens: sess.totalTokens,
+        turns: sess.turns,
+        contextUsed: sess.contextUsed ?? 0,
+      });
+    } else {
+      set({ sessions: filtered, activeSessionId: newActiveId });
+    }
   },
 
   renameSession: (id, name) => {
@@ -397,8 +411,9 @@ export const useStore = create<AppStore>((set, get) => ({
       case 'cost_update':
         if (e.cost !== undefined && e.tokens) {
           store.updateCost(e.cost, e.tokens);
-          // Update context pressure using actual input token count
-          store.setContextPressure(e.tokens.input, store.contextLimit);
+          // contextTokens = current turn's input tokens = actual context window occupancy.
+          // e.tokens.input is the cumulative billing sum across all turns, not window size.
+          store.setContextPressure(e.contextTokens ?? e.tokens.input, store.contextLimit);
         }
         break;
       case 'turn_start':

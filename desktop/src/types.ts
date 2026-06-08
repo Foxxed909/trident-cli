@@ -80,6 +80,7 @@ export interface TaskEvent {
   riskLevel?: RiskLevel;
   cost?: number;
   tokens?: { input: number; output: number };
+  contextTokens?: number;
   turn?: number;
   maxTurns?: number;
   exitCode?: number;

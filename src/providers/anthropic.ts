@@ -186,6 +186,7 @@ export async function* streamCompletion(
 }
 
 const PRICING: Record<string, { input: number; output: number }> = {
+  'claude-opus-4-8':            { input: 15,   output: 75   },
   'claude-opus-4-7':            { input: 15,   output: 75   },
   'claude-opus-4-5':            { input: 15,   output: 75   },
   'claude-sonnet-4-6':          { input: 3,    output: 15   },
@@ -194,6 +195,7 @@ const PRICING: Record<string, { input: number; output: number }> = {
 };
 
 export function calculateCost(model: string, inputTokens: number, outputTokens: number): number {
-  const pricing = PRICING[model] || { input: 0, output: 0 };
+  // Fallback to Sonnet pricing for unknown models (conservative, non-zero estimate)
+  const pricing = PRICING[model] || { input: 3, output: 15 };
   return (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
 }

@@ -113,7 +113,7 @@ program
   .description('AI-powered code review for a specific file')
   .argument('<file>', 'File to review')
   .option('-m, --model <model>', 'Model to use')
-  .option('-p, --provider <provider>', 'Provider: anthropic | openrouter')
+  .option('-p, --provider <provider>', 'Provider: anthropic | openrouter | vertex | bedrock')
   .action(async (file: string, opts: { model?: string; provider?: string }) => {
     const cwd = process.cwd();
     printLogo();
@@ -2424,7 +2424,7 @@ async function executeTask(
       beforeToolExecute,
       onToolEnd,
       onCostUpdate: desktopMode
-        ? (cost, tokens) => emitEvent({ type: 'cost_update', cost, tokens })
+        ? (cost, tokens, contextTokens) => emitEvent({ type: 'cost_update', cost, tokens, contextTokens })
         : jsonMode ? () => {} : printCostUpdate,
       permitRules: opts.permitRules,
       askUserFn: opts.askUserFn,
