@@ -531,9 +531,12 @@ function resolveProvider(cliProvider?: string, configProvider?: string, model?: 
   if (provider === 'openrouter') return 'openrouter';
   if (provider === 'anthropic') return 'anthropic';
   if (provider === 'codex') return 'codex';
+  if (provider === 'vertex') return 'vertex';
+  if (provider === 'bedrock') return 'bedrock';
   if (model && model.includes('/')) return 'openrouter';
-  if (configProvider === 'openrouter' || configProvider === 'anthropic' || configProvider === 'codex') {
-    return configProvider;
+  if (configProvider === 'openrouter' || configProvider === 'anthropic' || configProvider === 'codex'
+      || configProvider === 'vertex' || configProvider === 'bedrock') {
+    return configProvider as TridentProviderName;
   }
   return 'anthropic';
 }
@@ -821,9 +824,29 @@ async function runTrident(
       printError('Codex CLI is not available.');
       printInfo('Run: codex --version');
       printInfo('If Codex is installed but stale in this shell, open a new terminal or repair the global npm shim.');
-      if (!soft) {
-        process.exit(1);
-      }
+      if (!soft) process.exit(1);
+      return false;
+    }
+
+    if (providerToCheck === 'vertex') {
+      const hasProject = !!process.env.GOOGLE_CLOUD_PROJECT;
+      const hasToken = !!process.env.VERTEX_AI_ACCESS_TOKEN;
+      if (hasProject && hasToken) return true;
+      if (!hasProject) { printError('GOOGLE_CLOUD_PROJECT is not set.'); printInfo('Run: export GOOGLE_CLOUD_PROJECT=your-project-id'); }
+      if (!hasToken) { printError('VERTEX_AI_ACCESS_TOKEN is not set.'); printInfo('Run: export VERTEX_AI_ACCESS_TOKEN=$(gcloud auth print-access-token)'); }
+      if (!soft) process.exit(1);
+      return false;
+    }
+
+    if (providerToCheck === 'bedrock') {
+      const hasKey = !!process.env.AWS_ACCESS_KEY_ID;
+      const hasSecret = !!process.env.AWS_SECRET_ACCESS_KEY;
+      const hasRegion = !!process.env.AWS_REGION;
+      if (hasKey && hasSecret && hasRegion) return true;
+      if (!hasKey) { printError('AWS_ACCESS_KEY_ID is not set.'); }
+      if (!hasSecret) { printError('AWS_SECRET_ACCESS_KEY is not set.'); }
+      if (!hasRegion) { printError('AWS_REGION is not set.'); printInfo('Run: export AWS_REGION=us-east-1'); }
+      if (!soft) process.exit(1);
       return false;
     }
 
@@ -831,9 +854,7 @@ async function runTrident(
     const example = providerToCheck === 'openrouter' ? 'sk-or-...' : 'sk-ant-...';
     const fallbackModel = providerToCheck === 'anthropic' ? 'openai/gpt-4o' : 'claude-sonnet-4-6';
 
-    if (process.env[envKey]) {
-      return true;
-    }
+    if (process.env[envKey]) return true;
 
     printError(`${envKey} is not set.`);
     printInfo(`Run: ${formatEnvAssignment(envKey, example)}`);
@@ -843,9 +864,7 @@ async function runTrident(
       printInfo('Get a key at: https://openrouter.ai/keys');
     }
 
-    if (!soft) {
-      process.exit(1);
-    }
+    if (!soft) process.exit(1);
     return false;
   };
 
@@ -1031,7 +1050,7 @@ async function runTrident(
           systemOverrideActive: session.systemOverride.trim().length > 0,
           pinnedCount: pinnedFiles.size,
           planMode: session.planMode,
-          contextUsedTokens: session.tokens.input + session.tokens.output,
+          contextUsedTokens: session.tokens.input,
           contextLimitTokens: getContextLimit(session.model),
         });
         return true;

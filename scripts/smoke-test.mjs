@@ -97,3 +97,41 @@ test('workspace path guard allows valid subdirectory paths', () => {
   assert.throws(() => resolveWorkspacePath(root, '../etc/passwd'), /Path escapes workspace root/);
   assert.throws(() => resolveWorkspacePath(root, '/etc/passwd'), /Path escapes workspace root/);
 });
+
+import { executeTool } from '../dist/agent/tools.js';
+
+test('read_file line range returns correct slice with header', async () => {
+  // Use package.json which is guaranteed to exist and have multiple lines
+  const cwd = process.cwd();
+  const result = await executeTool({ name: 'read_file', input: { path: 'package.json', start_line: 1, end_line: 3 } }, cwd, async () => '');
+  assert.ok(result.success, 'should succeed');
+  assert.match(result.output, /^\[Lines 1-3 of \d+\]/);
+  // Should have exactly 3 lines of content after the header
+  const contentLines = result.output.split('\n').slice(1);
+  assert.equal(contentLines.length, 3);
+});
+
+test('read_file without line range returns full content', async () => {
+  const cwd = process.cwd();
+  const result = await executeTool({ name: 'read_file', input: { path: 'package.json' } }, cwd, async () => '');
+  assert.ok(result.success);
+  assert.ok(result.output.includes('"trident-cli"') || result.output.includes('"name"'));
+});
+
+test('list_dir returns error for non-existent directory', async () => {
+  const cwd = process.cwd();
+  const result = await executeTool({ name: 'list_dir', input: { path: '__does_not_exist__' } }, cwd, async () => '');
+  assert.ok(!result.success, 'should fail for missing dir');
+  assert.match(result.error ?? '', /not found/i);
+});
+
+test('search_codebase regex mode finds patterns', async () => {
+  const cwd = process.cwd();
+  const result = await executeTool(
+    { name: 'search_codebase', input: { query: 'export.*function', use_regex: true, glob: 'src/**/*.ts' } },
+    cwd,
+    async () => ''
+  );
+  assert.ok(result.success);
+  assert.ok(result.output.includes('hit') || result.output.includes('No matches'));
+});

@@ -56,12 +56,28 @@ export async function executeTool(
   try {
     switch (call.name) {
       case 'read_file': {
-        const filePath = resolveWorkspacePath(cwd, call.input.path as string);
+        const { path: rfPath, start_line, end_line } = call.input as { path: string; start_line?: number; end_line?: number };
+        const filePath = resolveWorkspacePath(cwd, rfPath);
         if (!existsSync(filePath)) {
           return { success: false, output: '', error: `File not found: ${filePath}`, duration_ms: Date.now() - start };
         }
-        const content = await readFile(filePath, 'utf-8');
-        return { success: true, output: content, duration_ms: Date.now() - start };
+        const raw = await readFile(filePath, 'utf-8');
+        if (start_line !== undefined || end_line !== undefined) {
+          const lines = raw.split('\n');
+          const total = lines.length;
+          const s = Math.max(0, (start_line ?? 1) - 1);
+          const e = Math.min(total, end_line ?? total);
+          const slice = lines.slice(s, e);
+          const header = `[Lines ${s + 1}-${e} of ${total}]\n`;
+          return { success: true, output: header + slice.join('\n'), duration_ms: Date.now() - start };
+        }
+        // Warn and truncate if very large
+        const MAX_CHARS = 100_000;
+        if (raw.length > MAX_CHARS) {
+          const truncated = raw.slice(0, MAX_CHARS);
+          return { success: true, output: `${truncated}\n\n[TRUNCATED: file is ${raw.length} chars; showing first ${MAX_CHARS}. Use start_line/end_line to read specific sections.]`, duration_ms: Date.now() - start };
+        }
+        return { success: true, output: raw, duration_ms: Date.now() - start };
       }
 
       case 'write_file': {
@@ -117,6 +133,14 @@ export async function executeTool(
       case 'list_dir': {
         const { path: dirPath, recursive = false } = call.input as { path: string; recursive?: boolean };
         const absPath = resolveWorkspacePath(cwd, dirPath);
+
+        if (!existsSync(absPath)) {
+          return { success: false, output: '', error: `Directory not found: ${absPath}`, duration_ms: Date.now() - start };
+        }
+        const ldStat = await lstat(absPath);
+        if (!ldStat.isDirectory()) {
+          return { success: false, output: '', error: `Not a directory: ${absPath}`, duration_ms: Date.now() - start };
+        }
 
         if (recursive) {
           const normalizedPath = absPath.replace(/\\/g, '/');
@@ -178,7 +202,12 @@ export async function executeTool(
       }
 
       case 'search_codebase': {
-        const { query, glob } = call.input as { query: string; glob?: string };
+        const { query, glob, use_regex = false, case_sensitive = false } = call.input as {
+          query: string;
+          glob?: string;
+          use_regex?: boolean;
+          case_sensitive?: boolean;
+        };
         const pattern = glob || '**/*.{ts,tsx,js,jsx,mjs,cjs,py,go,rs,java,rb,php,cs,cpp,c,h,hpp,md,json,yml,yaml,toml}';
         const files = await fg(pattern, {
           cwd,
@@ -188,7 +217,21 @@ export async function executeTool(
           followSymbolicLinks: false,
         });
 
-        const needle = query.toLowerCase();
+        let matcher: (line: string) => boolean;
+        if (use_regex) {
+          try {
+            const re = new RegExp(query, case_sensitive ? '' : 'i');
+            matcher = (line) => re.test(line);
+          } catch (e) {
+            return { success: false, output: '', error: `Invalid regex: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start };
+          }
+        } else {
+          const needle = case_sensitive ? query : query.toLowerCase();
+          matcher = case_sensitive
+            ? (line) => line.includes(needle)
+            : (line) => line.toLowerCase().includes(needle);
+        }
+
         const matches: string[] = [];
         let totalHits = 0;
         const MAX_FILES = 30;
@@ -207,7 +250,7 @@ export async function executeTool(
           const hits: string[] = [];
           let hiddenHits = 0;
           for (let i = 0; i < lines.length; i++) {
-            if (lines[i].toLowerCase().includes(needle)) {
+            if (matcher(lines[i])) {
               if (hits.length < MAX_LINES_PER_FILE) {
                 hits.push(`  ${i + 1}: ${lines[i].slice(0, 200)}`);
                 totalHits++;
@@ -244,7 +287,7 @@ export async function executeTool(
         try {
           resp = await fetch(url, {
             signal: AbortSignal.timeout(TIMEOUT_MS),
-            headers: { 'User-Agent': 'TRIDENT-CLI/1.0' },
+            headers: { 'User-Agent': 'Mozilla/5.0 TRIDENT-CLI/1.0' },
           });
         } catch (e) {
           return { success: false, output: '', error: `Fetch failed: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start };
@@ -257,6 +300,21 @@ export async function executeTool(
           text = await resp.text();
         } catch (e) {
           return { success: false, output: '', error: `Failed to read response body: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start };
+        }
+        const contentType = resp.headers.get('content-type') || '';
+        if (contentType.includes('text/html')) {
+          // Strip HTML tags, collapse whitespace, keep meaningful content
+          text = text
+            .replace(/<script[\s\S]*?<\/script>/gi, '')
+            .replace(/<style[\s\S]*?<\/style>/gi, '')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&amp;/g, '&')
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&nbsp;/g, ' ')
+            .replace(/&#\d+;/g, ' ')
+            .replace(/\s{3,}/g, '\n\n')
+            .trim();
         }
         return { success: true, output: text.slice(0, 16000), duration_ms: Date.now() - start };
       }
@@ -529,10 +587,14 @@ export function resolveWorkspacePath(workspaceRoot: string, targetPath: string):
 export const TOOL_DEFINITIONS = [
   {
     name: 'read_file',
-    description: 'Read the contents of a file',
+    description: 'Read the contents of a file. Use start_line/end_line to read a specific range and save tokens for large files.',
     input_schema: {
       type: 'object',
-      properties: { path: { type: 'string', description: 'Path to the file' } },
+      properties: {
+        path: { type: 'string', description: 'Path to the file' },
+        start_line: { type: 'number', description: 'First line to read (1-indexed, inclusive)' },
+        end_line: { type: 'number', description: 'Last line to read (1-indexed, inclusive)' },
+      },
       required: ['path'],
     },
   },
@@ -605,12 +667,14 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: 'search_codebase',
-    description: 'Search for a literal string across codebase files (case-insensitive). Optional glob narrows the search.',
+    description: 'Search for a string or regex pattern across codebase files. Returns matching lines with file paths and line numbers.',
     input_schema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Search string (literal, case-insensitive)' },
-        glob: { type: 'string', description: 'Optional glob pattern (e.g. "src/**/*.ts") to limit search' },
+        query: { type: 'string', description: 'Search string or regex pattern' },
+        glob: { type: 'string', description: 'Optional glob pattern (e.g. "src/**/*.ts") to limit search scope' },
+        use_regex: { type: 'boolean', description: 'Treat query as a regex pattern (default: false)' },
+        case_sensitive: { type: 'boolean', description: 'Case-sensitive match (default: false)' },
       },
       required: ['query'],
     },
