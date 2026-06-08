@@ -342,8 +342,8 @@ program
         }
       }
 
-      if (key === 'provider' && !['anthropic', 'openrouter', 'codex'].includes(value.toLowerCase())) {
-        console.log(chalk.red(`Invalid value for provider: "${value}". Must be one of: anthropic, openrouter, codex`));
+      if (key === 'provider' && !['anthropic', 'openrouter', 'codex', 'vertex', 'bedrock'].includes(value.toLowerCase())) {
+        console.log(chalk.red(`Invalid value for provider: "${value}". Must be one of: anthropic, openrouter, codex, vertex, bedrock`));
         process.exit(1);
       }
 
@@ -1487,11 +1487,8 @@ async function runTrident(
 
       case 'git': {
         const gitCmd = arg || 'status';
-        const isWindows = process.platform === 'win32';
-        const shellExe = isWindows ? 'cmd' : 'bash';
-        const shellFlag = isWindows ? '/c' : '-c';
         try {
-          const execRes = await execa(shellExe, [shellFlag, `git ${gitCmd}`], { cwd, reject: false, all: true });
+          const execRes = await execa('git', gitCmd.split(/\s+/).filter(Boolean), { cwd, reject: false, all: true });
           const out = (typeof execRes.all === 'string' ? execRes.all : '').trim();
           if (out) {
             console.log('');
@@ -1587,15 +1584,13 @@ async function runTrident(
       }
 
       case 'diff': {
-        const diffTarget = arg ? `-- ${arg}` : '';
-        const isWindows = process.platform === 'win32';
-        const shellExe = isWindows ? 'cmd' : 'bash';
-        const shellFlag = isWindows ? '/c' : '-c';
+        const diffArgs = arg ? ['diff', '--', arg] : ['diff'];
+        const diffCachedArgs = arg ? ['diff', '--cached', '--', arg] : ['diff', '--cached'];
         try {
-          const execRes = await execa(shellExe, [shellFlag, `git diff ${diffTarget}`], { cwd, reject: false, all: true });
+          const execRes = await execa('git', diffArgs, { cwd, reject: false, all: true });
           const out = (typeof execRes.all === 'string' ? execRes.all : '').trim();
           if (!out) {
-            const stagedRes = await execa(shellExe, [shellFlag, `git diff --cached ${diffTarget}`], { cwd, reject: false, all: true });
+            const stagedRes = await execa('git', diffCachedArgs, { cwd, reject: false, all: true });
             const staged = (typeof stagedRes.all === 'string' ? stagedRes.all : '').trim();
             if (!staged) {
               printInfo(arg ? `No changes in ${arg}` : 'No uncommitted changes.');
@@ -1691,9 +1686,8 @@ async function runTrident(
       // ── FEATURE: /snapshot ──────────────────────────────────────────────
       case 'snapshot': {
         const label = arg || `trident-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}`;
-        const isWin = process.platform === 'win32';
         try {
-          const res = await execa(isWin ? 'cmd' : 'bash', [isWin ? '/c' : '-c', `git stash push -u -m "TRIDENT: ${label}"`], { cwd, reject: false, all: true });
+          const res = await execa('git', ['stash', 'push', '-u', '-m', `TRIDENT: ${label}`], { cwd, reject: false, all: true });
           const out = (typeof res.all === 'string' ? res.all : '').trim();
           if ((res.exitCode ?? 1) === 0) {
             printSuccess(`Snapshot created: "${label}"`);
@@ -2046,6 +2040,10 @@ async function runTrident(
           }
         }
         const ghToken = process.env.GITHUB_TOKEN;
+        if (prWatchers.some(w => w.owner === prOwner && w.repo === prRepo && w.prNumber === prNumber)) {
+          printWarn(`Already watching ${prOwner}/${prRepo}#${prNumber}.`);
+          return true;
+        }
         try {
           const prState = await fetchPRState(prOwner, prRepo, prNumber, ghToken);
           printInfo(`Watching PR #${prNumber}: ${prState.title} [${prState.state}]`);
@@ -2133,13 +2131,15 @@ async function runTrident(
         maxTurns,
         budgetUsd: remainingBudget(session),
         logSessions: config.logSessions,
-        systemPrompt: getSystemPrompt(),
+        systemPrompt: getSystemPromptWithMcp(),
         profile: activeProfile,
         codexTimeoutMs,
         cwd,
         askUserFn,
         thinking: session.thinking,
         hooks,
+        mcpClients,
+        permitRules,
       }).then(result => {
         const bg = backgroundTasks.find(b => b.id === bgId);
         if (bg) { bg.status = result ? 'done' : 'failed'; bg.summary = result?.summary; bg.cost = result?.totalCost; }
@@ -2539,6 +2539,7 @@ function printAvailableModels(): void {
 
   console.log(chalk.bold('  ANTHROPIC (--provider anthropic)'));
   const anthropicModels = [
+    ['claude-opus-4-8', '$15 / $75 per M tokens'],
     ['claude-opus-4-7', '$15 / $75 per M tokens'],
     ['claude-sonnet-4-6', '$3  / $15 per M tokens'],
     ['claude-haiku-4-5-20251001', '$0.25 / $1.25 per M tokens'],

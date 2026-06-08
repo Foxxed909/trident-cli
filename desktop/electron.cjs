@@ -255,7 +255,7 @@ ipcMain.handle('list-sessions', async () => {
     const logsDir = path.join(os.homedir(), '.trident', 'logs');
     if (!fs.existsSync(logsDir)) return [];
     const files = fs.readdirSync(logsDir)
-      .filter(f => f.endsWith('.json') || f.endsWith('.log'))
+      .filter(f => f.endsWith('.jsonl'))
       .sort()
       .reverse()
       .slice(0, 50);
@@ -263,14 +263,16 @@ ipcMain.handle('list-sessions', async () => {
       const fpath = path.join(logsDir, f);
       try {
         const stat = fs.statSync(fpath);
+        // Read first line of JSONL to extract task/cost metadata if available
         const raw = fs.readFileSync(fpath, 'utf8');
+        const firstLine = raw.split('\n').find(l => l.trim());
         let data = {};
-        try { data = JSON.parse(raw); } catch {}
+        try { data = firstLine ? JSON.parse(firstLine) : {}; } catch {}
         return {
           id: f.replace(/\.[^.]+$/, ''),
           file: fpath,
           mtime: stat.mtime.toISOString(),
-          ...data,
+          task: data.toolName || undefined,
         };
       } catch {
         return { id: f, file: fpath };
@@ -318,7 +320,7 @@ ipcMain.handle('list-models', async () => {
 
 ipcMain.handle('shell-git', async (_, args) => {
   return new Promise((resolve) => {
-    execFile('git', args, { cwd: process.cwd() }, (err, stdout, stderr) => {
+    execFile('git', args, { cwd: currentCwd }, (err, stdout, stderr) => {
       if (err) resolve({ ok: false, error: err.message, stderr });
       else resolve({ ok: true, stdout, stderr });
     });
