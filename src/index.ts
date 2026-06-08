@@ -568,12 +568,26 @@ async function expandAtReferences(
     webp: 'image/webp',
   };
 
+  const MAX_FILE_SIZE = 1024 * 1024; // 1 MB limit for @ file references
+
   const matches = [...task.matchAll(atRe)];
   for (const match of matches) {
     const relPath = match[1];
     let absPath: string;
     try { absPath = resolveWorkspacePath(cwd, relPath); } catch { continue; }
     if (!existsSync(absPath)) continue;
+
+    // Skip directories — can't inline a directory as text
+    try {
+      const { lstat } = await import('fs/promises');
+      const st = await lstat(absPath);
+      if (st.isDirectory()) continue;
+      // Skip files larger than 1 MB to avoid flooding the context window
+      if (st.size > MAX_FILE_SIZE) {
+        expanded = expanded.replace(match[0], `[FILE TOO LARGE: ${relPath} (${(st.size / 1024 / 1024).toFixed(1)} MB, limit 1 MB)]`);
+        continue;
+      }
+    } catch { continue; }
 
     const ext = relPath.split('.').pop()?.toLowerCase() || '';
     if (imageExts.has(ext)) {
@@ -782,6 +796,7 @@ async function runTrident(
     return buildSystemPrompt(ctx, {
       profile: activeProfile,
       systemOverride: [systemOverride, getPinnedContext(), memorySection + planSection].filter(Boolean).join('\n\n'),
+      cwd,
     });
   };
 

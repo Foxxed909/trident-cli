@@ -195,21 +195,45 @@ function parseEventStreamMessages(buffer: Buffer): Array<{ headers: Record<strin
     const headers: Record<string, string> = {};
     let hi = headersStart;
     while (hi < headersEnd) {
+      if (hi >= headersEnd) break;
       const nameLen = buffer.readUInt8(hi);
       hi += 1;
+      if (hi + nameLen > headersEnd) break; // malformed
       const name = buffer.toString('utf-8', hi, hi + nameLen);
       hi += nameLen;
+      if (hi >= headersEnd) break; // malformed
       const valueType = buffer.readUInt8(hi);
       hi += 1;
+      // AWS event stream header value types:
+      //   0=bool true, 1=bool false, 2=byte, 3=short, 4=int, 5=long, 6=bytes, 7=string, 8=timestamp, 9=uuid
       if (valueType === 7) {
-        // string value
+        // string value: 2-byte length prefix
+        if (hi + 2 > headersEnd) break; // malformed
         const valueLen = buffer.readUInt16BE(hi);
         hi += 2;
+        if (hi + valueLen > headersEnd) break; // malformed
         const value = buffer.toString('utf-8', hi, hi + valueLen);
         hi += valueLen;
         headers[name] = value;
+      } else if (valueType === 0 || valueType === 1) {
+        // bool: no extra bytes
+      } else if (valueType === 2) {
+        hi += 1; // byte
+      } else if (valueType === 3) {
+        hi += 2; // short
+      } else if (valueType === 4) {
+        hi += 4; // int
+      } else if (valueType === 5 || valueType === 8) {
+        hi += 8; // long or timestamp
+      } else if (valueType === 9) {
+        hi += 16; // uuid
+      } else if (valueType === 6) {
+        // variable-length bytes: 2-byte length prefix (same as string)
+        if (hi + 2 > headersEnd) break; // malformed
+        const valueLen = buffer.readUInt16BE(hi);
+        hi += 2 + valueLen;
       } else {
-        // skip unknown types — consume just 1 byte (best effort)
+        // Unknown type — cannot safely skip; stop parsing headers for this message
         break;
       }
     }

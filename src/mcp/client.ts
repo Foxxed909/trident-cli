@@ -70,13 +70,21 @@ export class MCPClient {
     });
   }
 
+  /** Send a JSON-RPC notification (no id, no response expected). */
+  private notify(method: string, params?: unknown): void {
+    const msg = JSON.stringify({ jsonrpc: '2.0', method, params });
+    this.proc.stdin?.write(msg + '\n');
+  }
+
   async initialize(): Promise<void> {
     await this.request('initialize', {
       protocolVersion: '2024-11-05',
       capabilities: { tools: {} },
       clientInfo: { name: 'trident-cli', version: '1.0.0' },
     });
-    await this.request('notifications/initialized');
+    // 'notifications/initialized' is a JSON-RPC notification (no id, no response).
+    // Sending it as a request would cause an unresolvable pending promise / timeout.
+    this.notify('notifications/initialized');
     await this.listTools();
   }
 
@@ -107,10 +115,21 @@ export class MCPClient {
 
   destroy(): void {
     try {
+      // Close stdin first so the child process gets EOF and can shut down cleanly
+      this.proc.stdin?.end();
+    } catch {
+      // ignore
+    }
+    try {
       this.proc.kill();
     } catch {
       // ignore errors on destroy
     }
+    // Reject any pending requests so callers don't hang
+    for (const [, handler] of this.pending) {
+      handler.reject(new Error('MCP client destroyed'));
+    }
+    this.pending.clear();
   }
 }
 

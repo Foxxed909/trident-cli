@@ -44,15 +44,30 @@ export async function fetchPRState(
     ? await commentsResp.json() as Array<{ body: string }>
     : [];
 
-  // Fetch CI status (check runs / reviews)
-  const reviewsResp = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/reviews`,
-    { headers }
-  );
-  const reviews = reviewsResp.ok
-    ? await reviewsResp.json() as Array<{ state: string }>
-    : [];
-  const ciStatus = reviews.length > 0 ? reviews[reviews.length - 1].state : 'pending';
+  // Fetch CI status from check runs on the PR head commit (not reviews — reviews
+  // are human code-review approvals, not CI pipeline results).
+  const prFull = pr as { title: string; state: string; mergeable: boolean | null; head?: { sha?: string } };
+  const headSha = prFull.head?.sha;
+  let ciStatus = 'unknown';
+  if (headSha) {
+    const checkRunsResp = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/commits/${headSha}/check-runs?per_page=100`,
+      { headers }
+    );
+    if (checkRunsResp.ok) {
+      const checkRunsData = await checkRunsResp.json() as { check_runs: Array<{ status: string; conclusion: string | null }> };
+      const runs = checkRunsData.check_runs ?? [];
+      if (runs.length === 0) {
+        ciStatus = 'no checks';
+      } else if (runs.some(r => r.status !== 'completed')) {
+        ciStatus = 'pending';
+      } else if (runs.every(r => r.conclusion === 'success' || r.conclusion === 'skipped' || r.conclusion === 'neutral')) {
+        ciStatus = 'success';
+      } else {
+        ciStatus = 'failure';
+      }
+    }
+  }
 
   return {
     title: pr.title,

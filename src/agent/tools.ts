@@ -313,6 +313,7 @@ export async function executeTool(
 
       case 'web_search': {
         const { query, maxResults = 8 } = call.input as { query: string; maxResults?: number };
+        const cap = Math.max(1, maxResults as number);
         let searchResp: Response;
         try {
           searchResp = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
@@ -324,25 +325,56 @@ export async function executeTool(
         }
         let html: string;
         try { html = await searchResp.text(); } catch (e) { return { success: false, output: '', error: `Failed to read response: ${e instanceof Error ? e.message : String(e)}`, duration_ms: Date.now() - start }; }
+
+        /**
+         * DuckDuckGo HTML results use redirect hrefs of the form:
+         *   /l/?uddg=<url-encoded-destination>&...
+         * or occasionally direct URLs starting with https://.
+         * We extract the real destination URL from the uddg param when present.
+         */
+        function extractUrl(href: string): string {
+          if (href.startsWith('/l/?') || href.includes('uddg=')) {
+            try {
+              const params = new URLSearchParams(href.includes('?') ? href.slice(href.indexOf('?') + 1) : href);
+              const uddg = params.get('uddg');
+              if (uddg) return decodeURIComponent(uddg);
+            } catch { /* fall through */ }
+          }
+          // Also handle /url?q=<url> style
+          if (href.includes('/url?')) {
+            try {
+              const params = new URLSearchParams(href.slice(href.indexOf('?') + 1));
+              const q = params.get('q');
+              if (q) return q;
+            } catch { /* fall through */ }
+          }
+          return href;
+        }
+
         const results: string[] = [];
         const resultRegex = /<a class="result__a"[^>]*href="([^"]*)"[^>]*>([^<]*)<\/a>[\s\S]*?<a class="result__snippet"[^>]*>([^<]*)<\/a>/g;
         let rMatch;
         let count = 0;
-        while ((rMatch = resultRegex.exec(html)) !== null && count < (maxResults as number)) {
+        while ((rMatch = resultRegex.exec(html)) !== null && count < cap) {
           const [, href, title, snippet] = rMatch;
-          results.push(`${count + 1}. ${title.trim()}\n   URL: ${href}\n   ${snippet.trim()}`);
+          const url = extractUrl(href);
+          results.push(`${count + 1}. ${title.trim()}\n   URL: ${url}\n   ${snippet.trim()}`);
           count++;
         }
         if (results.length === 0) {
-          const titleRe = /<a[^>]+class="result__a"[^>]*>([^<]+)<\/a>/g;
+          const titleRe = /<a[^>]+class="result__a"[^>]*href="([^"]*)"[^>]*>([^<]+)<\/a>/g;
           const snippetRe = /<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
           const titles: string[] = [];
+          const urls: string[] = [];
           const snippets: string[] = [];
           let m;
-          while ((m = titleRe.exec(html)) !== null) titles.push(m[1].trim());
+          while ((m = titleRe.exec(html)) !== null && titles.length < cap) {
+            urls.push(extractUrl(m[1]));
+            titles.push(m[2].trim());
+          }
           while ((m = snippetRe.exec(html)) !== null) snippets.push(m[1].replace(/<[^>]+>/g, '').trim());
-          for (let i = 0; i < Math.min(titles.length, maxResults as number); i++) {
-            results.push(`${i + 1}. ${titles[i]}\n   ${snippets[i] || ''}`);
+          for (let i = 0; i < Math.min(titles.length, cap); i++) {
+            results.push(`${i + 1}. ${titles[i]}\n   URL: ${urls[i] || ''}\n   ${snippets[i] || ''}`);
           }
         }
         if (results.length === 0) {

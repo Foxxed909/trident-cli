@@ -259,7 +259,9 @@ export async function runAgentLoop(
       warnedMaxTurns = true;
     }
 
-    const contextPct = Math.round(((totalInputTokens + totalOutputTokens) / getContextLimit(opts.model)) * 100);
+    // Context window pressure is measured by input tokens only — output tokens
+    // are not part of the context window; only the prompt (input) consumes it.
+    const contextPct = Math.round((totalInputTokens / getContextLimit(opts.model)) * 100);
     if (contextPct >= 80 && !warnedMaxTurns) {
       opts.onContextPressure?.();
     }
@@ -324,6 +326,9 @@ export async function runAgentLoop(
           ...opts,
           systemPrompt: systemPrompt || opts.systemPrompt,
           maxTurns: Math.min(opts.maxTurns, 20),
+          // Do NOT pass parent's abortSignal — sub-agents should run to completion
+          // independently; aborting the parent should not abort child agents mid-task.
+          abortSignal: undefined,
           onText: (t) => { output += t; },
           onToolStart: undefined,
           onToolEnd: undefined,

@@ -287,7 +287,7 @@ ${ctx.tree}
 
 export function buildSystemPrompt(
   ctx: ProjectContext,
-  opts: { profile?: TrainedProfile | null; systemOverride?: string } = {}
+  opts: { profile?: TrainedProfile | null; systemOverride?: string; cwd?: string } = {}
 ): string {
   const tridentContext = ctx.tridentMdContent
     ? `\n\n## PROJECT CONTEXT (TRIDENT.md)\n${ctx.tridentMdContent}`
@@ -329,7 +329,7 @@ export function buildSystemPrompt(
 ${tridentContext}${profileContext}${overrideContext}
 
 ## Current Working Directory
-${process.cwd()}`;
+${opts.cwd ?? process.cwd()}`;
 }
 
 async function collectTreeEntries(

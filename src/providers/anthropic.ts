@@ -63,11 +63,20 @@ function findLastHumanMessageIndex(messages: ChatMessage[]): number {
   return -1;
 }
 
+/** Models that support the prompt-caching beta. Only these should get cache_control headers. */
+const CACHE_SUPPORTED_MODEL_PREFIXES = ['claude-'];
+
+function modelSupportsCaching(model: string): boolean {
+  return CACHE_SUPPORTED_MODEL_PREFIXES.some((prefix) => model.startsWith(prefix));
+}
+
 export async function* streamCompletion(
   messages: ChatMessage[],
   opts: ProviderOptions
 ): AsyncGenerator<StreamChunk> {
-  const useCache = opts.cacheEnabled !== false; // defaults true
+  // Only enable caching for known Claude models — custom or third-party model names
+  // would cause an API error if the prompt-caching beta header is sent.
+  const useCache = opts.cacheEnabled !== false && modelSupportsCaching(opts.model);
 
   // Build params
   const params: Record<string, unknown> = {
