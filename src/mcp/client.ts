@@ -52,7 +52,17 @@ export class MCPClient {
       }
     });
 
-    this.proc.stderr?.on('data', () => {}); // silence stderr
+    this.proc.stderr?.on('data', () => {}); // silence stderr — errors surface via rejected promises
+
+    // Fail all pending requests immediately if the server exits or errors
+    const rejectAll = (reason: string) => {
+      for (const [, handler] of this.pending) {
+        handler.reject(new Error(reason));
+      }
+      this.pending.clear();
+    };
+    this.proc.on('exit', (code) => rejectAll(`MCP server exited (code ${code ?? 'null'})`));
+    this.proc.on('error', (err) => rejectAll(`MCP server error: ${err.message}`));
   }
 
   private request(method: string, params?: unknown): Promise<unknown> {

@@ -174,21 +174,40 @@ export default function ToolCard({ toolCall, result, status }: ToolCardProps) {
                   <div style={{ color: 'var(--text-dim)', fontSize: '10px', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
                     Output
                   </div>
+                  {result.error && (
+                    <pre
+                      style={{
+                        background: 'var(--bg)',
+                        border: '1px solid var(--error)',
+                        borderRadius: '4px',
+                        padding: '6px 8px',
+                        fontSize: '11px',
+                        overflowX: 'auto',
+                        color: 'var(--error)',
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-all',
+                        maxHeight: '80px',
+                        marginBottom: result.output ? '6px' : 0,
+                      }}
+                    >
+                      {result.error}
+                    </pre>
+                  )}
                   <pre
                     style={{
                       background: 'var(--bg)',
-                      border: `1px solid ${result.error ? 'var(--error)' : 'var(--border)'}`,
+                      border: `1px solid var(--border)`,
                       borderRadius: '4px',
                       padding: '6px 8px',
                       fontSize: '11px',
                       overflowX: 'auto',
-                      color: result.error ? 'var(--error)' : 'var(--text-muted)',
+                      color: 'var(--text-muted)',
                       whiteSpace: 'pre-wrap',
                       wordBreak: 'break-all',
                       maxHeight: '200px',
                     }}
                   >
-                    {result.error || result.output || '(empty)'}
+                    {result.output || '(empty)'}
                   </pre>
                 </div>
               )}

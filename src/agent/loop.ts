@@ -56,6 +56,7 @@ export interface AgentOptions {
   thinkingBudget?: number;
   abortSignal?: AbortSignal;
   onText?: (text: string) => void;
+  onThinking?: (text: string) => void;
   onToolStart?: (call: ToolCall) => void | Promise<void>;
   beforeToolExecute?: (call: ToolCall) => void | Promise<void>;
   onToolEnd?: (call: ToolCall, result: ToolResult) => void;
@@ -211,6 +212,9 @@ export async function runAgentLoop(
             stopSpin();
             assistantText += chunk.text;
             opts.onText?.(chunk.text);
+          } else if (chunk.type === 'thinking' && chunk.text) {
+            stopSpin();
+            opts.onThinking?.(chunk.text);
           } else if (chunk.type === 'tool_call' && chunk.toolCall) {
             stopSpin();
             pendingToolCalls.push(chunk.toolCall);

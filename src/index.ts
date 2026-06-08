@@ -2420,6 +2420,13 @@ async function executeTask(
       onText: desktopMode
         ? (text) => emitEvent({ type: 'text', content: text })
         : jsonMode ? () => {} : printAgentText,
+      onThinking: desktopMode
+        ? (text) => emitEvent({ type: 'thinking', content: text })
+        : jsonMode ? () => {} : (text: string) => process.stdout.write(chalk.dim(`
+[thinking]
+${text}
+[/thinking]
+`)),
       onToolStart,
       beforeToolExecute,
       onToolEnd,

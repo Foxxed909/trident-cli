@@ -19,7 +19,7 @@ export interface ContentBlock {
 }
 
 export interface StreamChunk {
-  type: 'text' | 'tool_call' | 'done' | 'usage';
+  type: 'text' | 'tool_call' | 'done' | 'usage' | 'thinking';
   text?: string;
   toolCall?: ToolCall & { id: string };
   usage?: { inputTokens: number; outputTokens: number };
@@ -135,6 +135,8 @@ export async function* streamCompletion(
   let currentToolId: string | null = null;
   let currentToolName: string | null = null;
   let currentToolInput = '';
+  let currentThinking = '';
+  let inThinkingBlock = false;
   let inputTokens = 0;
   let outputTokens = 0;
 
@@ -148,14 +150,24 @@ export async function* streamCompletion(
         currentToolId = event.content_block.id;
         currentToolName = event.content_block.name;
         currentToolInput = '';
+      } else if ((event.content_block as { type: string }).type === 'thinking') {
+        inThinkingBlock = true;
+        currentThinking = '';
       }
     } else if (event.type === 'content_block_delta') {
       if (event.delta.type === 'text_delta') {
         yield { type: 'text', text: event.delta.text };
       } else if (event.delta.type === 'input_json_delta') {
         currentToolInput += event.delta.partial_json;
+      } else if ((event.delta as { type: string }).type === 'thinking_delta') {
+        currentThinking += (event.delta as { type: string; thinking?: string }).thinking ?? '';
       }
     } else if (event.type === 'content_block_stop') {
+      if (inThinkingBlock && currentThinking) {
+        yield { type: 'thinking', text: currentThinking };
+        currentThinking = '';
+        inThinkingBlock = false;
+      }
       if (currentToolId && currentToolName) {
         try {
           const input = JSON.parse(currentToolInput || '{}');
