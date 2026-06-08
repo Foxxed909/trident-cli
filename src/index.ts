@@ -15,7 +15,7 @@ import type { TridentConfig } from './config.js';
 import { runOnboarding } from './ui/onboarding.js';
 import { loadOrCreateContext, generateTridentMd, buildSystemPrompt, generateProjectTree } from './oracle/index.js';
 import { runAgentLoop, type ProviderName as AgentProviderName } from './agent/loop.js';
-import { resolveWorkspacePath } from './agent/tools.js';
+import { resolveWorkspacePath, TOOL_DEFINITIONS } from './agent/tools.js';
 import { listOpenRouterModels } from './providers/openrouter.js';
 import { codexSandboxForMode, isCodexCliAvailable, runCodexExec } from './providers/codex.js';
 import { formatProfileNames, listTrainedProfiles, resolveProfile, type TrainedProfile } from './profiles.js';
@@ -45,6 +45,8 @@ program
   .name('trident')
   .description('TRIDENT - All-Powerful Agentic AI Coding CLI')
   .version('1.0.0');
+
+program.showSuggestionAfterError();
 
 program
   .argument('[task]', 'Task to execute (omit for interactive mode)')
@@ -319,6 +321,87 @@ program
     } else {
       console.log(chalk.red('  Set at least one provider path to use TRIDENT.\n'));
     }
+  });
+
+program
+  .command('status')
+  .description('Show current config, workspace, and provider readiness')
+  .action(async () => {
+    printLogo();
+    console.log(chalk.cyan('\nTRIDENT Status\n'));
+
+    const rawConfig = getRawConfig();
+    const parsed = ConfigSchema.safeParse(rawConfig);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      const path = issue.path.length > 0 ? issue.path.join('.') : 'config';
+      printError(`Invalid config at ${path}: ${issue.message}`);
+      console.log(chalk.dim(`Config path: ${getConfigPath()}`));
+      console.log(chalk.dim('Run: trident heal --reset-config'));
+      process.exit(1);
+    }
+
+    const config = parsed.data;
+    const cwd = process.cwd();
+    const tridentMdPath = join(cwd, 'TRIDENT.md');
+    const hasAnthropic = !!process.env.ANTHROPIC_API_KEY;
+    const hasOpenRouter = !!process.env.OPENROUTER_API_KEY;
+    const hasCodexCli = await isCodexCliAvailable();
+    const providerReady =
+      (config.provider === 'anthropic' && hasAnthropic) ||
+      (config.provider === 'openrouter' && hasOpenRouter) ||
+      (config.provider === 'codex' && hasCodexCli);
+
+    const rows: Array<[string, string]> = [
+      ['workspace', cwd],
+      ['context', existsSync(tridentMdPath) ? 'TRIDENT.md present' : 'missing (run: trident init)'],
+      ['provider', `${config.provider}${providerReady ? ' (ready)' : ' (needs setup)'}`],
+      ['model', config.provider === 'codex' ? (config.codexModel || 'codex default') : config.model],
+      ['mode', config.mode],
+      ['profile', config.profile || 'none'],
+      ['max turns', String(config.maxTurns)],
+      ['budget', config.budgetUsd === undefined ? 'none' : `$${config.budgetUsd}`],
+      ['session logs', config.logSessions ? 'on' : 'off'],
+      ['config path', getConfigPath()],
+    ];
+
+    for (const [key, value] of rows) {
+      console.log('  ' + chalk.gray(key.padEnd(13)) + chalk.white(value));
+    }
+    console.log('');
+  });
+
+program
+  .command('sessions')
+  .description('List recent TRIDENT session log files')
+  .option('-n, --limit <n>', 'Number of session logs to show', '10')
+  .action(async (opts: { limit?: string }) => {
+    const limit = resolvePositiveInteger(opts.limit, 10, 'limit');
+    const files = await getRecentSessionLogFiles(limit);
+    if (files.length === 0) {
+      printInfo('No session logs found.');
+      return;
+    }
+
+    console.log(chalk.cyan('\nTRIDENT Recent Sessions\n'));
+    for (const file of files) {
+      console.log(`  ${chalk.white(file.replace('.jsonl', ''))}`);
+    }
+    console.log('');
+  });
+
+program
+  .command('tools')
+  .description('List the agent tools exposed to model providers')
+  .action(() => {
+    console.log(chalk.cyan('\nTRIDENT Agent Tools\n'));
+    for (const tool of TOOL_DEFINITIONS) {
+      const required = Array.isArray(tool.input_schema.required) && tool.input_schema.required.length
+        ? ` required: ${tool.input_schema.required.join(', ')}`
+        : '';
+      console.log(`  ${chalk.white(tool.name.padEnd(16))} ${chalk.gray(tool.description)}${chalk.dim(required)}`);
+    }
+    console.log('');
   });
 
 program
