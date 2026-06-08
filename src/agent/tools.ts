@@ -37,6 +37,7 @@ export type ToolName =
 export interface ToolCall {
   name: ToolName;
   input: Record<string, unknown>;
+  id?: string;
 }
 
 export interface EditOperation {

@@ -310,7 +310,7 @@ export async function runAgentLoop(
     const toolResults: Array<{ type: 'tool_result'; tool_use_id: string; content: string }> = [];
 
     for (const tc of pendingToolCalls) {
-      const call: ToolCall = { name: tc.name, input: tc.input };
+      const call: ToolCall = { name: tc.name, input: tc.input, id: tc.id };
       const risk = classifyRisk(call);
 
       if (opts.onToolStart) {

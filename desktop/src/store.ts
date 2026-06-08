@@ -390,15 +390,12 @@ export const useStore = create<AppStore>((set, get) => ({
       case 'cost_update':
         if (e.cost !== undefined && e.tokens) {
           store.updateCost(e.cost, e.tokens);
+          // Update context pressure using actual input token count
+          store.setContextPressure(e.tokens.input, store.contextLimit);
         }
         break;
       case 'turn_start':
         store.incrementTurns();
-        if (e.turn && e.maxTurns) {
-          // context estimate: rough heuristic
-          const used = (e.turn / e.maxTurns) * store.contextLimit;
-          store.setContextPressure(Math.round(used), store.contextLimit);
-        }
         break;
       case 'done':
         store.setRunning(false);

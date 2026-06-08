@@ -20,7 +20,7 @@ import { resolveWorkspacePath } from './agent/tools.js';
 import { listOpenRouterModels } from './providers/openrouter.js';
 import { codexSandboxForMode, isCodexCliAvailable, runCodexExec } from './providers/codex.js';
 import { formatProfileNames, listTrainedProfiles, resolveProfile, type TrainedProfile } from './profiles.js';
-import { loadHooks, runHook, type HooksConfig } from './warden/index.js';
+import { loadHooks, runHook, classifyRisk, type HooksConfig } from './warden/index.js';
 import { MCPClient, loadMCPConfig } from './mcp/client.js';
 import type { MCPToolDefinition } from './mcp/client.js';
 import { fetchPRState } from './github/pr-watcher.js';
@@ -2290,17 +2290,28 @@ async function executeTask(
 
   const sessionId = randomUUID();
   const hooks = opts.hooks ?? {};
+  const desktopMode = process.env.TRIDENT_DESKTOP === '1';
+
+  // Emit a single-line JSON event to stdout (for desktop subprocess consumption)
+  const emitEvent = (event: Record<string, unknown>): void => {
+    process.stdout.write(JSON.stringify(event) + '\n');
+  };
 
   // Set up abort controller for Ctrl+C interrupt
   const abortController = new AbortController();
   const sigintHandler = () => {
-    if (!jsonMode) console.log(chalk.yellow('\n  [TRIDENT] Interrupted. Stopping task...'));
+    if (!jsonMode && !desktopMode) console.log(chalk.yellow('\n  [TRIDENT] Interrupted. Stopping task...'));
     abortController.abort();
   };
   process.once('SIGINT', sigintHandler);
 
   const onToolStart = async (call: import('./agent/tools.js').ToolCall): Promise<void> => {
-    if (!jsonMode) printToolStart(call);
+    if (desktopMode) {
+      const risk = classifyRisk(call);
+      emitEvent({ type: 'tool_start', toolId: call.id, toolName: call.name, toolInput: call.input, riskLevel: risk });
+    } else if (!jsonMode) {
+      printToolStart(call);
+    }
   };
 
   const beforeToolExecute = async (call: import('./agent/tools.js').ToolCall): Promise<void> => {
@@ -2324,7 +2335,11 @@ async function executeTask(
   };
 
   const onToolEnd = (call: import('./agent/tools.js').ToolCall, result: import('./agent/tools.js').ToolResult): void => {
-    printToolEnd(call, result);
+    if (desktopMode) {
+      emitEvent({ type: 'tool_end', toolId: call.id, toolOutput: result.output, toolError: result.error, durationMs: result.duration_ms });
+    } else {
+      printToolEnd(call, result);
+    }
     // Run after_tool hook if configured (fire-and-forget)
     if (hooks.after_tool?.[call.name]) {
       runHook(hooks.after_tool[call.name], opts.cwd).catch(() => {});
@@ -2346,27 +2361,37 @@ async function executeTask(
       autoFormat: opts.autoFormat ?? false,
       thinking: opts.thinking,
       abortSignal: abortController.signal,
-      onTurnStart: process.stdout.isTTY
-        ? (turn, maxTurns) => {
-            const spinner = ora({ text: chalk.dim(`thinking · turn ${turn}/${maxTurns}`), color: 'cyan', discardStdin: false }).start();
-            return () => { spinner.stop(); process.stdout.write('\r\x1b[K'); };
-          }
-        : undefined,
-      onTurnComplete: (turn, turnCost) => {
-        if (process.stdout.isTTY) {
-          process.stdout.write(chalk.dim(`\n  ↳ turn ${turn} · $${turnCost.toFixed(5)}\n`));
-        }
-      },
-      onContextPressure: () => {
-        if (process.stdout.isTTY) {
-          process.stdout.write(chalk.hex('#F5C97A')('\n  [TRIDENT] Context approaching limit — consider /compact\n'));
-        }
-      },
-      onText: jsonMode ? () => {} : printAgentText,
+      onTurnStart: desktopMode
+        ? (turn, maxTurns) => { emitEvent({ type: 'turn_start', turn, maxTurns }); }
+        : process.stdout.isTTY
+          ? (turn, maxTurns) => {
+              const spinner = ora({ text: chalk.dim(`thinking · turn ${turn}/${maxTurns}`), color: 'cyan', discardStdin: false }).start();
+              return () => { spinner.stop(); process.stdout.write('\r\x1b[K'); };
+            }
+          : undefined,
+      onTurnComplete: desktopMode
+        ? undefined
+        : (turn, turnCost) => {
+            if (process.stdout.isTTY) {
+              process.stdout.write(chalk.dim(`\n  ↳ turn ${turn} · $${turnCost.toFixed(5)}\n`));
+            }
+          },
+      onContextPressure: desktopMode
+        ? undefined
+        : () => {
+            if (process.stdout.isTTY) {
+              process.stdout.write(chalk.hex('#F5C97A')('\n  [TRIDENT] Context approaching limit — consider /compact\n'));
+            }
+          },
+      onText: desktopMode
+        ? (text) => emitEvent({ type: 'text', content: text })
+        : jsonMode ? () => {} : printAgentText,
       onToolStart,
       beforeToolExecute,
-      onToolEnd: jsonMode ? () => {} : onToolEnd,
-      onCostUpdate: jsonMode ? () => {} : printCostUpdate,
+      onToolEnd,
+      onCostUpdate: desktopMode
+        ? (cost, tokens) => emitEvent({ type: 'cost_update', cost, tokens })
+        : jsonMode ? () => {} : printCostUpdate,
       permitRules: opts.permitRules,
       askUserFn: opts.askUserFn,
       initialImageBlocks: opts.imageBlocks,
@@ -2374,12 +2399,16 @@ async function executeTask(
       mcpToolDefinitions: opts.mcpClients?.flatMap(c => c.getTools()),
     });
 
-    if (!jsonMode) {
+    if (desktopMode) {
+      emitEvent({ type: 'done', exitCode: result?.success ? 0 : 1, summary: result?.summary });
+    } else if (!jsonMode) {
       printFinalSummary(result);
     }
     return result;
   } catch (err) {
-    if (!jsonMode) {
+    if (desktopMode) {
+      emitEvent({ type: 'error', content: err instanceof Error ? err.message : String(err) });
+    } else if (!jsonMode) {
       console.log('');
       printError(err instanceof Error ? err.message : String(err));
     }

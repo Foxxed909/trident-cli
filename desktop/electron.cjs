@@ -139,13 +139,17 @@ ipcMain.handle('run-task', async (event, task, opts = {}) => {
     } catch {}
   };
 
+  let cliSentDone = false;
+
   child.stdout.on('data', (data) => {
     const lines = data.toString().split('\n');
     for (const line of lines) {
       if (!line.trim()) continue;
       let parsed = null;
       try { parsed = JSON.parse(line); } catch {}
-      safeSend('task-event', parsed ?? { type: 'text', content: line });
+      const event = parsed ?? { type: 'text', content: line };
+      if (event.type === 'done' || event.type === 'error') cliSentDone = true;
+      safeSend('task-event', event);
     }
   });
 
@@ -163,7 +167,10 @@ ipcMain.handle('run-task', async (event, task, opts = {}) => {
       settled = true;
       clearTimeout(timeoutHandle);
       currentTask = null;
-      safeSend('task-event', { type: 'done', exitCode: exitCode ?? 0 });
+      // Only send a fallback done if the CLI didn't already emit one
+      if (!cliSentDone) {
+        safeSend('task-event', { type: error ? 'error' : 'done', exitCode: exitCode ?? 0, content: error });
+      }
       resolve(error ? { exitCode: exitCode ?? 1, error } : { exitCode });
     };
 

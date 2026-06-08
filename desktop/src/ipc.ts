@@ -5,7 +5,9 @@ export function randomId(): string {
 }
 
 export function formatCost(cost: number): string {
-  if (cost < 0.001) return `$${(cost * 1000).toFixed(3)}m`;
+  if (cost === 0) return '$0';
+  if (cost < 0.0001) return `<$0.0001`;
+  if (cost < 0.01) return `$${cost.toFixed(6)}`;
   return `$${cost.toFixed(4)}`;
 }
 
@@ -62,7 +64,7 @@ export function getToolIcon(toolName: string): string {
 
 export function extractPreview(input: Record<string, unknown>): string {
   // Try common key names
-  for (const key of ['path', 'file_path', 'command', 'query', 'pattern', 'url', 'content']) {
+  for (const key of ['path', 'file_path', 'cmd', 'command', 'query', 'pattern', 'url', 'task', 'content']) {
     if (input[key] && typeof input[key] === 'string') {
       return truncate(input[key] as string, 80);
     }
