@@ -80,6 +80,7 @@ export function classifyRisk(call: ToolCall): RiskLevel {
 
     case 'write_file':
     case 'edit_file':
+    case 'move_file':
     case 'memory_update':
     case 'edit_notebook_cell':
       return 'write';
@@ -195,6 +196,8 @@ function formatInputPreview(call: ToolCall): string {
     case 'read_pdf':
     case 'read_image':
       return `  file ${chalk.cyan(call.input.path as string)}`;
+    case 'move_file':
+      return `  ${chalk.cyan(call.input.source as string)} → ${chalk.cyan(call.input.destination as string)}`;
     case 'memory_update':
       return `  fact: ${chalk.cyan(String(call.input.fact || '').slice(0, 60))}`;
     case 'web_search':

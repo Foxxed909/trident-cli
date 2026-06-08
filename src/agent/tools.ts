@@ -1,4 +1,4 @@
-import { readFile, writeFile, unlink, readdir, lstat } from 'fs/promises';
+import { readFile, writeFile, unlink, readdir, lstat, rename, mkdir as mkdirAsync } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, resolve, relative, isAbsolute } from 'path';
 import { execa } from 'execa';
@@ -17,6 +17,7 @@ export type ToolName =
   | 'write_file'
   | 'edit_file'
   | 'delete_file'
+  | 'move_file'
   | 'list_dir'
   | 'run_command'
   | 'search_codebase'
@@ -128,6 +129,24 @@ export async function executeTool(
         }
         await unlink(absPath);
         return { success: true, output: `Deleted: ${relative(cwd, absPath)}`, duration_ms: Date.now() - start };
+      }
+
+      case 'move_file': {
+        const { source, destination } = call.input as { source: string; destination: string };
+        const srcPath = resolveWorkspacePath(cwd, source);
+        const dstPath = resolveWorkspacePath(cwd, destination);
+        if (!existsSync(srcPath)) {
+          return { success: false, output: '', error: `Source not found: ${srcPath}`, duration_ms: Date.now() - start };
+        }
+        // Ensure destination parent directory exists
+        const { dirname: pathDirname } = await import('path');
+        await mkdirAsync(pathDirname(dstPath), { recursive: true });
+        await rename(srcPath, dstPath);
+        return {
+          success: true,
+          output: `Moved: ${relative(cwd, srcPath)} → ${relative(cwd, dstPath)}`,
+          duration_ms: Date.now() - start,
+        };
       }
 
       case 'list_dir': {
@@ -639,6 +658,18 @@ export const TOOL_DEFINITIONS = [
       type: 'object',
       properties: { path: { type: 'string', description: 'Path to the file' } },
       required: ['path'],
+    },
+  },
+  {
+    name: 'move_file',
+    description: 'Move or rename a file or directory',
+    input_schema: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', description: 'Source path' },
+        destination: { type: 'string', description: 'Destination path' },
+      },
+      required: ['source', 'destination'],
     },
   },
   {

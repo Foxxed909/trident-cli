@@ -59,6 +59,7 @@ test('classifyRisk assigns correct levels', () => {
   assert.equal(classifyRisk({ name: 'read_file', input: {} }), 'read');
   assert.equal(classifyRisk({ name: 'write_file', input: {} }), 'write');
   assert.equal(classifyRisk({ name: 'edit_file', input: {} }), 'write');
+  assert.equal(classifyRisk({ name: 'move_file', input: {} }), 'write');
   assert.equal(classifyRisk({ name: 'delete_file', input: {} }), 'destructive');
   assert.equal(classifyRisk({ name: 'github_api', input: {} }), 'execute');
   assert.equal(classifyRisk({ name: 'run_command', input: { cmd: 'ls' } }), 'execute');
