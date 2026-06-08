@@ -69,6 +69,7 @@ export interface AgentOptions {
   cacheTools?: boolean;
   permitRules?: PermitRule[];
   askUserFn: (question: string) => Promise<string>;
+  initialImageBlocks?: Array<{ mediaType: string; data: string }>;
 }
 
 export interface AgentResult {
@@ -94,7 +95,17 @@ export async function runAgentLoop(
   opts: AgentOptions
 ): Promise<AgentResult> {
   const logger = new SessionLogger(opts.sessionId, opts.logSessions);
-  const messages: ChatMessage[] = [{ role: 'user', content: initialTask }];
+  const initialContent: import('../providers/anthropic.js').ContentBlock[] | string =
+    opts.initialImageBlocks && opts.initialImageBlocks.length > 0
+      ? [
+          { type: 'text', text: initialTask },
+          ...opts.initialImageBlocks.map(img => ({
+            type: 'image' as const,
+            source: { type: 'base64' as const, media_type: img.mediaType, data: img.data },
+          })),
+        ]
+      : initialTask;
+  const messages: ChatMessage[] = [{ role: 'user', content: initialContent }];
 
   const enableToolCache = opts.toolResultCaching !== false && opts.cacheTools !== false;
   const toolCache = new Map<string, ToolResult>();
@@ -106,6 +117,7 @@ export async function runAgentLoop(
   let finalAnswerFound = false;
   let budgetExceeded = false;
   let warnedMaxTurns = false;
+  let warnedContextPressure = false;
   const turnCostHistory: Array<{ turn: number; cost: number }> = [];
 
   while (turns < opts.maxTurns) {
@@ -262,7 +274,8 @@ export async function runAgentLoop(
     // Context window pressure is measured by input tokens only — output tokens
     // are not part of the context window; only the prompt (input) consumes it.
     const contextPct = Math.round((totalInputTokens / getContextLimit(opts.model)) * 100);
-    if (contextPct >= 80 && !warnedMaxTurns) {
+    if (contextPct >= 80 && !warnedContextPressure) {
+      warnedContextPressure = true;
       opts.onContextPressure?.();
     }
 

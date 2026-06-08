@@ -7,13 +7,14 @@ export interface ChatMessage {
 }
 
 export interface ContentBlock {
-  type: 'text' | 'tool_use' | 'tool_result';
+  type: 'text' | 'tool_use' | 'tool_result' | 'image';
   id?: string;
   name?: string;
   input?: Record<string, unknown>;
   tool_use_id?: string;
   content?: string;
   text?: string;
+  source?: { type: 'base64'; media_type: string; data: string };
   cache_control?: { type: 'ephemeral' };
 }
 

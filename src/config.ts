@@ -4,7 +4,7 @@ import { TRAINED_PROFILE_NAMES } from './profiles.js';
 
 export const ConfigSchema = z.object({
   model: z.string().min(1).default('claude-sonnet-4-6'),
-  provider: z.enum(['anthropic', 'openrouter', 'codex']).default('anthropic'),
+  provider: z.enum(['anthropic', 'openrouter', 'codex', 'vertex', 'bedrock']).default('anthropic'),
   mode: z.enum(['yolo', 'review', 'lockdown']).default('review'),
   maxTurns: z.number().int().positive().default(50),
   budgetUsd: z.number().positive().optional(),

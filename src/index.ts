@@ -929,7 +929,7 @@ async function runTrident(
 
   if (initialTask) {
     if (hooks.on_task_start) await runHook(hooks.on_task_start, cwd);
-    const { expanded: expandedTask } = await expandAtReferences(initialTask, cwd);
+    const { expanded: expandedTask, imageBlocks: initialImageBlocks } = await expandAtReferences(initialTask, cwd);
     const result = await executeTask(expandedTask, {
       model,
       mode,
@@ -947,6 +947,7 @@ async function runTrident(
       outputMode: outputFormat,
       mcpClients,
       permitRules,
+      imageBlocks: initialImageBlocks,
     });
     if (hooks.on_task_end) await runHook(hooks.on_task_end, cwd);
     for (const client of mcpClients) client.destroy();
@@ -1401,8 +1402,8 @@ async function runTrident(
         return true;
 
       case 'provider': {
-        if (!arg || !/^(anthropic|openrouter|codex)$/i.test(arg)) {
-          printError('Usage: /provider anthropic | openrouter | codex');
+        if (!arg || !/^(anthropic|openrouter|codex|vertex|bedrock)$/i.test(arg)) {
+          printError('Usage: /provider anthropic | openrouter | codex | vertex | bedrock');
           return true;
         }
         const nextProvider = arg.toLowerCase() as TridentProviderName;
@@ -1848,9 +1849,10 @@ async function runTrident(
             const qResult = await executeTask(qt, {
               model: session.model, mode: session.mode, provider: session.provider,
               maxTurns, budgetUsd: remainingBudget(session),
-              logSessions: config.logSessions, systemPrompt: getSystemPrompt(),
+              logSessions: config.logSessions, systemPrompt: getSystemPromptWithMcp(),
               profile: activeProfile, codexTimeoutMs, cwd, askUserFn, undoStack,
               autoTest: session.autoTest, autoFormat: session.autoFormat, planMode: session.planMode,
+              thinking: session.thinking, hooks, mcpClients, permitRules,
             });
             if (qResult) {
               session.cost += qResult.totalCost;
@@ -2145,7 +2147,7 @@ async function runTrident(
     if (hooks.on_task_start) await runHook(hooks.on_task_start, cwd);
 
     // Expand @filepath references before sending to agent
-    const { expanded: expandedTask } = await expandAtReferences(task, cwd);
+    const { expanded: expandedTask, imageBlocks: taskImageBlocks } = await expandAtReferences(task, cwd);
 
     const taskIdx = taskHistory.length;
     const result = await executeTask(expandedTask, {
@@ -2167,6 +2169,7 @@ async function runTrident(
       thinking: session.thinking,
       mcpClients,
       permitRules,
+      imageBlocks: taskImageBlocks,
     });
 
     if (hooks.on_task_end) await runHook(hooks.on_task_end, cwd);
@@ -2236,6 +2239,7 @@ async function executeTask(
     outputMode?: 'pretty' | 'json';
     mcpClients?: MCPClient[];
     permitRules?: Array<{ tool: string; pattern?: string; description?: string }>;
+    imageBlocks?: Array<{ mediaType: string; data: string }>;
   }
 ): Promise<Awaited<ReturnType<typeof runAgentLoop>> | null> {
   const jsonMode = opts.outputMode === 'json';
@@ -2365,6 +2369,7 @@ async function executeTask(
       onCostUpdate: jsonMode ? () => {} : printCostUpdate,
       permitRules: opts.permitRules,
       askUserFn: opts.askUserFn,
+      initialImageBlocks: opts.imageBlocks,
     });
 
     if (!jsonMode) {

@@ -547,7 +547,10 @@ export async function executeTool(
         const { path: filePath, pages } = call.input as { path: string; pages?: string };
         const absPath = resolveWorkspacePath(cwd, filePath);
         if (!existsSync(absPath)) return { success: false, output: '', error: `File not found: ${absPath}`, duration_ms: Date.now() - start };
-        const pageFlag = pages ? `-f ${pages.split('-')[0] || 1} -l ${pages.split('-')[1] || 999}` : '';
+        const pageParts = pages?.trim() ? pages.trim().split('-') : [];
+        const pageFlag = pageParts.length > 0
+          ? `-f ${pageParts[0] || '1'} -l ${pageParts[1] ?? pageParts[0] ?? '999'}`
+          : '';
         const isWin = process.platform === 'win32';
         const res = await execa(isWin ? 'cmd' : 'bash', [isWin ? '/c' : '-c', `pdftotext ${pageFlag} "${absPath}" -`], { reject: false, all: true, timeout: 30000 });
         const out = typeof res.all === 'string' ? res.all : '';
