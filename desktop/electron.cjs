@@ -116,16 +116,18 @@ ipcMain.handle('run-task', async (event, task, opts = {}) => {
 
   const args = [CLI_PATH, task];
 
+  // Pass opts as actual CLI flags so the process reads them (not env vars)
+  if (opts.model) args.push('--model', opts.model);
+  if (opts.provider) args.push('--provider', opts.provider);
+  if (opts.mode) args.push('--mode', opts.mode);
+  if (opts.maxTurns) args.push('--max-turns', String(opts.maxTurns));
+  if (opts.budget != null) args.push('--budget', String(opts.budget));
+  if (opts.thinking) args.push('--thinking');
+
   const env = {
     ...process.env,
     TRIDENT_DESKTOP: '1',
-    TRIDENT_OUTPUT: 'json',
   };
-
-  if (opts.model) env.TRIDENT_MODEL = opts.model;
-  if (opts.provider) env.TRIDENT_PROVIDER = opts.provider;
-  if (opts.mode) env.TRIDENT_MODE = opts.mode;
-  if (opts.cwd) env.TRIDENT_CWD = opts.cwd;
 
   const spawnCwd = opts.cwd || process.cwd();
   if (opts.cwd) currentCwd = opts.cwd;
@@ -370,3 +372,44 @@ ipcMain.handle('show-notification', async (_, { title, body }) => {
 });
 
 ipcMain.handle('get-cwd', async () => currentCwd);
+
+// Permit rules persistence
+function getPermitsPath() {
+  return path.join(os.homedir(), '.config', 'trident-cli', 'permits.json');
+}
+
+ipcMain.handle('get-permits', async () => {
+  try {
+    const p = getPermitsPath();
+    if (!fs.existsSync(p)) return [];
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch {
+    return [];
+  }
+});
+
+ipcMain.handle('set-permits', async (_, rules) => {
+  try {
+    // Save in desktop format
+    const p = getPermitsPath();
+    const dir = path.dirname(p);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(rules, null, 2));
+
+    // Also sync to CLI's allow.json (only enabled rules, in CLI format)
+    const cliAllowDir = path.join(os.homedir(), '.trident');
+    if (!fs.existsSync(cliAllowDir)) fs.mkdirSync(cliAllowDir, { recursive: true });
+    const cliRules = (rules || [])
+      .filter(r => r.enabled)
+      .map(r => ({
+        tool: r.toolPattern,
+        pattern: r.pathPattern || undefined,
+        description: r.description || undefined,
+      }));
+    fs.writeFileSync(path.join(cliAllowDir, 'allow.json'), JSON.stringify(cliRules, null, 2));
+
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});

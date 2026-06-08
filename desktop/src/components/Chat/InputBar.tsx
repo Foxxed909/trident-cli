@@ -2,29 +2,45 @@ import React, { useRef, useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useStore } from '../../store';
 import GlowPulse from '../animations/GlowPulse';
+import type { FileTreeNode } from '../../types';
 
 interface InputBarProps {
   onSubmit: (text: string) => void;
   disabled?: boolean;
 }
 
-const FILE_SUGGESTIONS = [
-  'src/index.ts',
-  'src/agent/loop.ts',
-  'src/config.ts',
-  'package.json',
-  'tsconfig.json',
-  'README.md',
-];
+function flattenTree(nodes: FileTreeNode[], prefix = ''): string[] {
+  const paths: string[] = [];
+  for (const node of nodes) {
+    const p = prefix ? `${prefix}/${node.name}` : node.name;
+    if (node.type === 'file') {
+      paths.push(p);
+    } else if (node.children) {
+      paths.push(...flattenTree(node.children, p));
+    }
+  }
+  return paths;
+}
 
 export default function InputBar({ onSubmit, disabled }: InputBarProps) {
   const [value, setValue] = useState('');
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [atQuery, setAtQuery] = useState('');
   const [hovering, setHovering] = useState(false);
+  const [projectFiles, setProjectFiles] = useState<string[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isRunning = useStore(s => s.isRunning);
   const config = useStore(s => s.config);
+  const cwd = useStore(s => s.cwd);
+
+  // Load project file tree for @ suggestions
+  useEffect(() => {
+    window.trident?.getProjectTree(cwd || undefined).then(res => {
+      if (res.ok && res.tree) {
+        setProjectFiles(flattenTree(res.tree));
+      }
+    }).catch(() => {});
+  }, [cwd]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -92,14 +108,18 @@ export default function InputBar({ onSubmit, disabled }: InputBarProps) {
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     const files = Array.from(e.dataTransfer.files);
-    const paths = files.map(f => `@${f.name}`).join(' ');
+    const paths = files.map(f => {
+      // Electron exposes the full filesystem path via webkitRelativePath or the file object
+      const full = (f as File & { path?: string }).path;
+      return `@${full || f.name}`;
+    }).join(' ');
     setValue(v => v + (v ? ' ' : '') + paths + ' ');
     textareaRef.current?.focus();
   }, []);
 
-  const filteredSuggestions = FILE_SUGGESTIONS.filter(f =>
-    f.toLowerCase().includes(atQuery.toLowerCase())
-  );
+  const filteredSuggestions = projectFiles
+    .filter(f => f.toLowerCase().includes(atQuery.toLowerCase()))
+    .slice(0, 12);
 
   const modeColors: Record<string, string> = {
     yolo: 'var(--error)',

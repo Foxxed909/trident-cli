@@ -1,4 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React from 'react';
+import { useStore } from '../../store';
 
 interface StreamingTextProps {
   text: string;
@@ -192,8 +193,8 @@ function renderInline(text: string): React.ReactNode {
 }
 
 export default function StreamingText({ text, streaming = false, className, style }: StreamingTextProps) {
-  const wordWrap = true; // Could be from store
-  const rendered = renderMarkdown(text, wordWrap);
+  const wordWrap = useStore(s => s.wordWrap);
+  const rendered = renderMarkdown(text || '', wordWrap);
 
   return (
     <div

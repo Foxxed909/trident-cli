@@ -533,7 +533,12 @@ function resolveProvider(cliProvider?: string, configProvider?: string, model?: 
   if (provider === 'codex') return 'codex';
   if (provider === 'vertex') return 'vertex';
   if (provider === 'bedrock') return 'bedrock';
-  if (model && model.includes('/')) return 'openrouter';
+  // Auto-detect from model name pattern
+  if (model) {
+    if (model.includes('/')) return 'openrouter';
+    if (model.includes('.') && model.includes(':')) return 'bedrock';
+    if (model.includes('@')) return 'vertex';
+  }
   if (configProvider === 'openrouter' || configProvider === 'anthropic' || configProvider === 'codex'
       || configProvider === 'vertex' || configProvider === 'bedrock') {
     return configProvider as TridentProviderName;
@@ -587,7 +592,7 @@ async function expandAtReferences(
       if (st.isDirectory()) continue;
       // Skip files larger than 1 MB to avoid flooding the context window
       if (st.size > MAX_FILE_SIZE) {
-        expanded = expanded.replace(match[0], `[FILE TOO LARGE: ${relPath} (${(st.size / 1024 / 1024).toFixed(1)} MB, limit 1 MB)]`);
+        expanded = expanded.replaceAll(match[0], `[FILE TOO LARGE: ${relPath} (${(st.size / 1024 / 1024).toFixed(1)} MB, limit 1 MB)]`);
         continue;
       }
     } catch { continue; }
@@ -601,14 +606,14 @@ async function expandAtReferences(
         mediaType: mediaTypeMap[ext] || 'image/png',
         data: bytes.toString('base64'),
       });
-      expanded = expanded.replace(match[0], `[IMAGE: ${relPath} (base64, ${bytes.length} bytes, ${mediaTypeMap[ext] || 'image/png'})]`);
+      expanded = expanded.replaceAll(match[0], `[IMAGE: ${relPath} (base64, ${bytes.length} bytes, ${mediaTypeMap[ext] || 'image/png'})]`);
     } else {
       // Text file - inline content
       let content: string;
       try { content = await fsReadFile(absPath, 'utf-8'); } catch { continue; }
       const ext2 = relPath.split('.').pop() || '';
       const block = `\n\n### ${relPath}\n\`\`\`${ext2}\n${content.slice(0, 8000)}\n\`\`\`\n`;
-      expanded = expanded.replace(match[0], block);
+      expanded = expanded.replaceAll(match[0], block);
     }
   }
   return { expanded, imageBlocks };
@@ -1432,7 +1437,10 @@ async function runTrident(
         }
         const nextProvider: TridentProviderName = session.provider === 'codex'
           ? 'codex'
-          : arg.includes('/') ? 'openrouter' : session.provider;
+          : arg.includes('/') ? 'openrouter'
+          : (arg.includes('.') && arg.includes(':')) ? 'bedrock'
+          : arg.includes('@') ? 'vertex'
+          : session.provider;
         if (!(await ensureProviderReady(nextProvider, true))) {
           return true;
         }

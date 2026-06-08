@@ -8,11 +8,16 @@ export default function History() {
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<HistorySession | null>(null);
 
-  useEffect(() => {
+  const loadSessions = () => {
+    setLoading(true);
     window.trident?.listSessions().then(s => {
       setSessions(s);
       setLoading(false);
     }).catch(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    loadSessions();
   }, []);
 
   if (loading) {
@@ -28,7 +33,7 @@ export default function History() {
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-dim)', gap: '12px' }}>
         <span style={{ fontSize: '32px', opacity: 0.3 }}>◎</span>
         <span style={{ fontFamily: 'var(--font-mono)', fontSize: '13px' }}>No sessions recorded yet</span>
-        <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>Sessions are saved to ~/.trident/sessions/</span>
+        <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>Sessions are saved to ~/.trident/logs/</span>
       </div>
     );
   }
@@ -51,8 +56,25 @@ export default function History() {
           textTransform: 'uppercase',
           letterSpacing: '0.1em',
           borderBottom: '1px solid var(--border)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
         }}>
-          Session History ({sessions.length})
+          <span>Session History ({sessions.length})</span>
+          <button
+            onClick={loadSessions}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: 'var(--text-dim)',
+              cursor: 'pointer',
+              fontSize: '12px',
+              padding: '0 4px',
+            }}
+            title="Refresh"
+          >
+            ↺
+          </button>
         </div>
         {sessions.map((sess) => (
           <motion.div

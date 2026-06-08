@@ -138,6 +138,7 @@ export const useStore = create<AppStore>((set, get) => ({
       totalCost: sess.totalCost,
       totalTokens: sess.totalTokens,
       turns: sess.turns,
+      contextUsed: sess.contextUsed ?? 0,
     });
   },
 
@@ -320,7 +321,13 @@ export const useStore = create<AppStore>((set, get) => ({
     });
   },
 
-  setContextPressure: (used, limit) => set({ contextUsed: used, contextLimit: limit }),
+  setContextPressure: (used, limit) => set(s => ({
+    contextUsed: used,
+    contextLimit: limit,
+    sessions: s.sessions.map(sess =>
+      sess.id === s.activeSessionId ? { ...sess, contextUsed: used } : sess
+    ),
+  })),
 
   config: null,
   setConfig: (cfg) => set({ config: cfg }),

@@ -56,7 +56,7 @@ export default function StatusBar() {
         style={{ maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
         title={cwd}
       >
-        {cwd === '.' ? process.cwd?.() || '~' : cwd}
+        {cwd}
       </span>
 
       <span style={{ color: 'var(--border)' }}>│</span>

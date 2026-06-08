@@ -39,6 +39,10 @@ contextBridge.exposeInMainWorld('trident', {
   showNotification: (opts) => ipcRenderer.invoke('show-notification', opts),
   getCwd: () => ipcRenderer.invoke('get-cwd'),
 
+  // Permit rules
+  getPermits: () => ipcRenderer.invoke('get-permits'),
+  setPermits: (rules) => ipcRenderer.invoke('set-permits', rules),
+
   // Window controls
   minimize: () => ipcRenderer.send('window-minimize'),
   maximize: () => ipcRenderer.send('window-maximize'),

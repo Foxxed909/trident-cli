@@ -58,6 +58,9 @@ export default function ChatView() {
       model: config?.model,
       provider: config?.provider,
       mode: config?.mode,
+      maxTurns: config?.maxTurns,
+      budget: config?.budgetUsd ?? undefined,
+      thinking: config?.thinking || false,
       cwd,
     }).catch(() => {
       setRunning(false);

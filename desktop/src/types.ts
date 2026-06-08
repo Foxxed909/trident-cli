@@ -96,6 +96,7 @@ export interface Session {
   createdAt: number;
   cwd?: string;
   isRunning?: boolean;
+  contextUsed?: number;
 }
 
 export interface HistorySession {
@@ -148,6 +149,8 @@ declare global {
       openExternal: (url: string) => Promise<void>;
       showNotification: (opts: { title: string; body: string }) => Promise<void>;
       getCwd: () => Promise<string>;
+      getPermits: () => Promise<PermitRule[]>;
+      setPermits: (rules: PermitRule[]) => Promise<{ ok: boolean }>;
       minimize: () => void;
       maximize: () => void;
       close: () => void;

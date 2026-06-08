@@ -22,19 +22,36 @@ export default function Permits() {
   const [descInput, setDescInput] = useState('');
   const [adding, setAdding] = useState(false);
 
+  const persistPermits = (updated: typeof permits) => {
+    window.trident?.setPermits(updated).catch(() => {});
+  };
+
   const handleAdd = () => {
     if (!toolInput.trim()) return;
-    addPermit({
+    const rule = {
       id: randomId(),
       toolPattern: toolInput.trim(),
       pathPattern: patternInput.trim() || undefined,
       description: descInput.trim() || undefined,
       enabled: true,
-    });
+    };
+    addPermit(rule);
+    persistPermits([...permits, rule]);
     setToolInput('');
     setPatternInput('');
     setDescInput('');
     setAdding(false);
+  };
+
+  const handleToggle = (id: string) => {
+    togglePermit(id);
+    const updated = permits.map(p => p.id === id ? { ...p, enabled: !p.enabled } : p);
+    persistPermits(updated);
+  };
+
+  const handleRemove = (id: string) => {
+    removePermit(id);
+    persistPermits(permits.filter(p => p.id !== id));
   };
 
   const riskColors: Record<string, string> = {
@@ -101,7 +118,7 @@ export default function Permits() {
                   <input
                     type="checkbox"
                     checked={rule.enabled}
-                    onChange={() => togglePermit(rule.id)}
+                    onChange={() => handleToggle(rule.id)}
                   />
                   <span className="toggle-slider" />
                 </label>
@@ -134,7 +151,7 @@ export default function Permits() {
 
                 {/* Remove */}
                 <button
-                  onClick={() => removePermit(rule.id)}
+                  onClick={() => handleRemove(rule.id)}
                   style={{ color: 'var(--text-dim)', fontSize: '16px', flexShrink: 0 }}
                   onMouseEnter={e => (e.currentTarget.style.color = 'var(--error)')}
                   onMouseLeave={e => (e.currentTarget.style.color = 'var(--text-dim)')}

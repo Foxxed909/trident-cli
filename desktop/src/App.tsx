@@ -17,24 +17,27 @@ export default function App() {
   const currentView = useStore(s => s.currentView);
   const commandPaletteOpen = useStore(s => s.commandPaletteOpen);
   const setCommandPaletteOpen = useStore(s => s.setCommandPaletteOpen);
-  const { setConfig, setModels, setCwd } = useStore(s => ({
+  const { setConfig, setModels, setCwd, addPermit } = useStore(s => ({
     setConfig: s.setConfig,
     setModels: s.setModels,
     setCwd: s.setCwd,
+    addPermit: s.addPermit,
   }));
 
-  // Bootstrap: load config, models, cwd
+  // Bootstrap: load config, models, cwd, permits
   useEffect(() => {
     Promise.all([
       window.trident?.getConfig(),
       window.trident?.listModels(),
       window.trident?.getCwd(),
-    ]).then(([cfg, models, cwd]) => {
+      window.trident?.getPermits(),
+    ]).then(([cfg, models, cwd, permits]) => {
       if (cfg) setConfig(cfg);
       if (models) setModels(models);
       if (cwd) setCwd(cwd);
+      if (permits) permits.forEach(p => addPermit(p));
     }).catch(() => {});
-  }, [setConfig, setModels, setCwd]);
+  }, [setConfig, setModels, setCwd, addPermit]);
 
   // Global keyboard shortcuts
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
