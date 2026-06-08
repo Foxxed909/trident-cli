@@ -912,6 +912,7 @@ async function runTrident(
       hooks,
       outputMode: outputFormat,
       mcpClients,
+      permitRules,
     });
     if (hooks.on_task_end) await runHook(hooks.on_task_end, cwd);
     for (const client of mcpClients) client.destroy();
@@ -1070,6 +1071,7 @@ async function runTrident(
           planMode: session.planMode,
           thinking: session.thinking,
           mcpClients,
+          permitRules,
         });
         if (result) {
           session.cost += result.totalCost;
@@ -2130,6 +2132,7 @@ async function runTrident(
       planMode: session.planMode,
       thinking: session.thinking,
       mcpClients,
+      permitRules,
     });
 
     if (hooks.on_task_end) await runHook(hooks.on_task_end, cwd);
@@ -2198,6 +2201,7 @@ async function executeTask(
     hooks?: HooksConfig;
     outputMode?: 'pretty' | 'json';
     mcpClients?: MCPClient[];
+    permitRules?: Array<{ tool: string; pattern?: string; description?: string }>;
   }
 ): Promise<Awaited<ReturnType<typeof runAgentLoop>> | null> {
   const jsonMode = opts.outputMode === 'json';
@@ -2325,6 +2329,7 @@ async function executeTask(
       beforeToolExecute,
       onToolEnd: jsonMode ? () => {} : onToolEnd,
       onCostUpdate: jsonMode ? () => {} : printCostUpdate,
+      permitRules: opts.permitRules,
       askUserFn: opts.askUserFn,
     });
 

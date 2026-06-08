@@ -9,7 +9,7 @@ import { streamBedrock, calculateBedrockCost } from '../providers/bedrock.js';
 import { executeTool, TOOL_DEFINITIONS, resolveWorkspacePath, type ToolCall, type ToolResult } from './tools.js';
 import { classifyRisk, requestApproval, SessionLogger } from '../warden/index.js';
 import type { ChatMessage } from '../providers/anthropic.js';
-import type { ApprovalMode } from '../warden/index.js';
+import type { ApprovalMode, PermitRule } from '../warden/index.js';
 
 export type ProviderName = 'anthropic' | 'openrouter' | 'vertex' | 'bedrock';
 
@@ -67,6 +67,7 @@ export interface AgentOptions {
   autoFormat?: boolean;
   toolResultCaching?: boolean;
   cacheTools?: boolean;
+  permitRules?: PermitRule[];
   askUserFn: (question: string) => Promise<string>;
 }
 
@@ -293,7 +294,7 @@ export async function runAgentLoop(
         await showDiffPreview(call, opts.cwd);
       }
 
-      const approved = await requestApproval(call, opts.mode, risk);
+      const approved = await requestApproval(call, opts.mode, risk, opts.permitRules);
 
       if (!approved) {
         const result: ToolResult = {
