@@ -164,7 +164,7 @@ export default function MessageBubble({ message, fontSize }: MessageBubbleProps)
           }}
         >
           {message.content.map((block, i) => {
-            if (block.type === 'text' && i === message.content.length - 1 && isStreamingText) {
+            if (block.type === 'text' && isStreamingText && block === lastTextBlock) {
               return (
                 <StreamingText
                   key={i}

@@ -56,6 +56,14 @@ export default function InputBar({ onSubmit, disabled }: InputBarProps) {
     }
   }, []);
 
+  const handleSend = useCallback(() => {
+    const text = value.trim();
+    if (!text || isRunning) return;
+    setValue('');
+    setShowSuggestions(false);
+    onSubmit(text);
+  }, [value, isRunning, onSubmit]);
+
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey && !showSuggestions) {
       e.preventDefault();
@@ -65,15 +73,7 @@ export default function InputBar({ onSubmit, disabled }: InputBarProps) {
     if (e.key === 'Escape') {
       setShowSuggestions(false);
     }
-  }, [value, showSuggestions, isRunning]);
-
-  const handleSend = useCallback(() => {
-    const text = value.trim();
-    if (!text || isRunning) return;
-    setValue('');
-    setShowSuggestions(false);
-    onSubmit(text);
-  }, [value, isRunning, onSubmit]);
+  }, [showSuggestions, handleSend]);
 
   const insertSuggestion = useCallback((file: string) => {
     const atIdx = value.lastIndexOf('@');
