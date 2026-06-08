@@ -70,6 +70,8 @@ export interface AgentOptions {
   permitRules?: PermitRule[];
   askUserFn: (question: string) => Promise<string>;
   initialImageBlocks?: Array<{ mediaType: string; data: string }>;
+  mcpClients?: Array<{ getServerName(): string; callTool(name: string, input: Record<string, unknown>): Promise<string> }>;
+  mcpToolDefinitions?: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
 }
 
 export interface AgentResult {
@@ -109,6 +111,16 @@ export async function runAgentLoop(
 
   const enableToolCache = opts.toolResultCaching !== false && opts.cacheTools !== false;
   const toolCache = new Map<string, ToolResult>();
+
+  // Build combined tool list: built-in + MCP tools converted to Anthropic schema
+  const allToolDefinitions = [
+    ...TOOL_DEFINITIONS,
+    ...(opts.mcpToolDefinitions ?? []).map(t => ({
+      name: t.name,
+      description: t.description,
+      input_schema: t.inputSchema,
+    })),
+  ];
 
   let turns = 0;
   let totalInputTokens = 0;
@@ -158,7 +170,7 @@ export async function runAgentLoop(
               model: opts.model,
               maxTokens: 8096,
               systemPrompt: opts.systemPrompt,
-              tools: TOOL_DEFINITIONS,
+              tools: allToolDefinitions,
               apiKey: process.env.OPENROUTER_API_KEY || '',
             });
             break;
@@ -167,7 +179,7 @@ export async function runAgentLoop(
               model: opts.model,
               maxTokens: 8096,
               systemPrompt: opts.systemPrompt,
-              tools: TOOL_DEFINITIONS,
+              tools: allToolDefinitions,
             });
             break;
           case 'bedrock':
@@ -175,7 +187,7 @@ export async function runAgentLoop(
               model: opts.model,
               maxTokens: 8096,
               systemPrompt: opts.systemPrompt,
-              tools: TOOL_DEFINITIONS,
+              tools: allToolDefinitions,
             });
             break;
           default:
@@ -183,7 +195,7 @@ export async function runAgentLoop(
               model: opts.model,
               maxTokens: 8096,
               systemPrompt: opts.systemPrompt,
-              tools: TOOL_DEFINITIONS,
+              tools: allToolDefinitions,
               thinking: opts.thinking,
               thinkingBudget: opts.thinkingBudget,
               signal: opts.abortSignal,
@@ -354,7 +366,17 @@ export async function runAgentLoop(
       };
 
       let result: ToolResult;
-      if (enableToolCache && READ_ONLY_TOOLS.has(call.name)) {
+      // Route MCP tool calls to the appropriate MCPClient
+      const mcpClient = opts.mcpClients?.find(c => call.name.startsWith(c.getServerName() + '__'));
+      if (mcpClient) {
+        const mcpStart = Date.now();
+        try {
+          const mcpOutput = await mcpClient.callTool(call.name, call.input);
+          result = { success: true, output: mcpOutput || '(no output)', duration_ms: Date.now() - mcpStart };
+        } catch (mcpErr) {
+          result = { success: false, output: '', error: mcpErr instanceof Error ? mcpErr.message : String(mcpErr), duration_ms: Date.now() - mcpStart };
+        }
+      } else if (enableToolCache && READ_ONLY_TOOLS.has(call.name)) {
         const cacheKey = `${call.name}:${JSON.stringify(call.input)}`;
         const cached = toolCache.get(cacheKey);
         if (cached) {

@@ -186,7 +186,8 @@ export const useStore = create<AppStore>((set, get) => ({
         const content = [...lastMsg.content];
         const textIdx = content.findIndex(c => c.type === 'text');
         if (textIdx >= 0) {
-          content[textIdx] = { type: 'text', text: (content[textIdx] as { type: 'text'; text: string }).text + text };
+          const existing = content[textIdx] as { type: 'text'; text?: string };
+          content[textIdx] = { type: 'text', text: (existing.text ?? '') + text };
         } else {
           content.push({ type: 'text', text });
         }

@@ -2370,6 +2370,8 @@ async function executeTask(
       permitRules: opts.permitRules,
       askUserFn: opts.askUserFn,
       initialImageBlocks: opts.imageBlocks,
+      mcpClients: opts.mcpClients,
+      mcpToolDefinitions: opts.mcpClients?.flatMap(c => c.getTools()),
     });
 
     if (!jsonMode) {

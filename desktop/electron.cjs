@@ -106,15 +106,15 @@ ipcMain.on('window-close', () => {
 
 // Run a task by spawning the CLI
 ipcMain.handle('run-task', async (event, task, opts = {}) => {
-  // Abort any existing task
+  // Kill any running task before starting a new one
   if (currentTask) {
-    try { currentTask.process.kill('SIGTERM'); } catch {}
+    const prev = currentTask;
     currentTask = null;
+    try { prev.process.kill('SIGTERM'); } catch {}
   }
 
   const args = [CLI_PATH, task];
 
-  // Pass options as env vars / flags
   const env = {
     ...process.env,
     TRIDENT_DESKTOP: '1',
@@ -133,35 +133,47 @@ ipcMain.handle('run-task', async (event, task, opts = {}) => {
 
   currentTask = { process: child };
 
+  const safeSend = (channel, payload) => {
+    try {
+      if (!event.sender.isDestroyed()) event.sender.send(channel, payload);
+    } catch {}
+  };
+
   child.stdout.on('data', (data) => {
     const lines = data.toString().split('\n');
     for (const line of lines) {
       if (!line.trim()) continue;
       let parsed = null;
       try { parsed = JSON.parse(line); } catch {}
-      if (parsed) {
-        event.sender.send('task-event', parsed);
-      } else {
-        event.sender.send('task-event', { type: 'text', content: line });
-      }
+      safeSend('task-event', parsed ?? { type: 'text', content: line });
     }
   });
 
   child.stderr.on('data', (data) => {
-    event.sender.send('task-event', { type: 'error', content: data.toString() });
+    safeSend('task-event', { type: 'error', content: data.toString() });
   });
 
+  // Hard timeout: 30 minutes — prevents the IPC promise hanging forever
+  const TASK_TIMEOUT_MS = 30 * 60 * 1000;
+
   return new Promise((resolve) => {
-    child.on('close', (code) => {
+    let settled = false;
+    const finish = (exitCode, error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutHandle);
       currentTask = null;
-      event.sender.send('task-event', { type: 'done', exitCode: code });
-      resolve({ exitCode: code });
-    });
-    child.on('error', (err) => {
-      currentTask = null;
-      event.sender.send('task-event', { type: 'error', content: err.message });
-      resolve({ exitCode: 1, error: err.message });
-    });
+      safeSend('task-event', { type: 'done', exitCode: exitCode ?? 0 });
+      resolve(error ? { exitCode: exitCode ?? 1, error } : { exitCode });
+    };
+
+    const timeoutHandle = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch {}
+      finish(1, 'Task timed out after 30 minutes');
+    }, TASK_TIMEOUT_MS);
+
+    child.on('close', (code) => finish(code));
+    child.on('error', (err) => finish(1, err.message));
   });
 });
 

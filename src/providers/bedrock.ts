@@ -313,6 +313,7 @@ export async function* streamBedrock(
 
   const reader = resp.body.getReader();
   let rawBuffer = Buffer.alloc(0);
+  const MAX_STREAM_BUFFER = 32 * 1024 * 1024; // 32 MB guard against unbounded growth
 
   let currentToolId: string | null = null;
   let currentToolName: string | null = null;
@@ -325,6 +326,9 @@ export async function* streamBedrock(
     if (done) break;
 
     rawBuffer = Buffer.concat([rawBuffer, Buffer.from(value)]);
+    if (rawBuffer.length > MAX_STREAM_BUFFER) {
+      throw new Error(`Bedrock stream buffer exceeded ${MAX_STREAM_BUFFER / 1024 / 1024} MB — aborting`);
+    }
 
     // Try to parse event-stream messages from the accumulated buffer
     while (rawBuffer.length >= 12) {

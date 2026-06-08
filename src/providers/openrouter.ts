@@ -186,7 +186,7 @@ export async function* streamOpenRouter(
             const input = JSON.parse(tc.arguments || '{}');
             yield {
               type: 'tool_call',
-              toolCall: { id: tc.id || `tool_${Date.now()}`, name: tc.name as ToolCall['name'], input },
+              toolCall: { id: tc.id || `tool_${Date.now()}_${Math.random().toString(36).slice(2)}`, name: tc.name as ToolCall['name'], input },
             };
           } catch {
             // Malformed tool args
@@ -242,7 +242,7 @@ export async function* streamOpenRouter(
         const input = JSON.parse(tc.arguments || '{}');
         yield {
           type: 'tool_call',
-          toolCall: { id: tc.id || `tool_${Date.now()}`, name: tc.name as ToolCall['name'], input },
+          toolCall: { id: tc.id || `tool_${Date.now()}_${Math.random().toString(36).slice(2)}`, name: tc.name as ToolCall['name'], input },
         };
       } catch {
         // Malformed tool args
