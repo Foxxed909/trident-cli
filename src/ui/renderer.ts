@@ -254,6 +254,7 @@ export function printPrompt(): void {
 
 export function printWelcome(): void {
   console.log(chalk.hex(SLATE)('  ready - type a task or '), chalk.white('/help'), chalk.hex(SLATE)(' for commands'));
+  console.log(chalk.hex(SLATE)('  tip: '), chalk.white('@path/to/file'), chalk.hex(SLATE)(' inlines file content into your prompt'));
   console.log('');
 }
 
@@ -321,6 +322,27 @@ export function printSlashHelp(): void {
         ['/lock', 'shortcut for /mode lockdown'],
         ['/models', 'list available models'],
         ['/sessions', 'list past session log files'],
+      ],
+    },
+    {
+      label: 'MCP',
+      cmds: [
+        ['/mcp-list', 'list connected MCP tools'],
+        ['/mcp-call <tool> <json>', 'call an MCP tool manually'],
+      ],
+    },
+    {
+      label: 'Permits',
+      cmds: [
+        ['/permits', 'list auto-approval permit rules'],
+        ['/permit <tool> [pattern]', 'add a permit rule for a tool'],
+      ],
+    },
+    {
+      label: 'PR Watch',
+      cmds: [
+        ['/pr-watch <owner/repo#n>', 'watch a GitHub PR for changes'],
+        ['/pr-unwatch', 'stop all PR watchers'],
       ],
     },
   ];

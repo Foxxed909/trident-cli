@@ -21,6 +21,10 @@ import { listOpenRouterModels } from './providers/openrouter.js';
 import { codexSandboxForMode, isCodexCliAvailable, runCodexExec } from './providers/codex.js';
 import { formatProfileNames, listTrainedProfiles, resolveProfile, type TrainedProfile } from './profiles.js';
 import { loadHooks, runHook, type HooksConfig } from './warden/index.js';
+import { MCPClient, loadMCPConfig } from './mcp/client.js';
+import type { MCPToolDefinition } from './mcp/client.js';
+import { fetchPRState } from './github/pr-watcher.js';
+import type { PRWatcher } from './github/pr-watcher.js';
 import {
   printLogo,
   printSessionHeader,
@@ -61,6 +65,7 @@ program
   .option('--codex-model <model>', 'Codex CLI model override (provider=codex only)')
   .option('--codex-timeout <ms>', 'Codex CLI timeout in milliseconds')
   .option('--thinking', 'Enable extended thinking (Anthropic only)')
+  .option('--output <format>', 'Output format: pretty | json', 'pretty')
   .action(async (task?: string, opts?: {
     model?: string;
     provider?: string;
@@ -72,6 +77,7 @@ program
     codexModel?: string;
     codexTimeout?: string;
     thinking?: boolean;
+    output?: string;
   }) => {
     await runTrident(task, opts);
   });
@@ -545,6 +551,52 @@ interface BackgroundTask {
   cost?: number;
 }
 
+async function expandAtReferences(
+  task: string,
+  cwd: string
+): Promise<{ expanded: string; imageBlocks: Array<{ path: string; mediaType: string; data: string }> }> {
+  // Find all @filepath tokens (not email-like @word, must have extension or /)
+  const atRe = /@([\w./\\-]+\.\w+)/g;
+  let expanded = task;
+  const imageBlocks: Array<{ path: string; mediaType: string; data: string }> = [];
+  const imageExts = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp']);
+  const mediaTypeMap: Record<string, string> = {
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    png: 'image/png',
+    gif: 'image/gif',
+    webp: 'image/webp',
+  };
+
+  const matches = [...task.matchAll(atRe)];
+  for (const match of matches) {
+    const relPath = match[1];
+    let absPath: string;
+    try { absPath = resolveWorkspacePath(cwd, relPath); } catch { continue; }
+    if (!existsSync(absPath)) continue;
+
+    const ext = relPath.split('.').pop()?.toLowerCase() || '';
+    if (imageExts.has(ext)) {
+      // Image file - collect for vision block
+      const bytes = await fsReadFile(absPath);
+      imageBlocks.push({
+        path: relPath,
+        mediaType: mediaTypeMap[ext] || 'image/png',
+        data: bytes.toString('base64'),
+      });
+      expanded = expanded.replace(match[0], `[IMAGE: ${relPath} (base64, ${bytes.length} bytes, ${mediaTypeMap[ext] || 'image/png'})]`);
+    } else {
+      // Text file - inline content
+      let content: string;
+      try { content = await fsReadFile(absPath, 'utf-8'); } catch { continue; }
+      const ext2 = relPath.split('.').pop() || '';
+      const block = `\n\n### ${relPath}\n\`\`\`${ext2}\n${content.slice(0, 8000)}\n\`\`\`\n`;
+      expanded = expanded.replace(match[0], block);
+    }
+  }
+  return { expanded, imageBlocks };
+}
+
 async function showCommandPicker(
   rl: ReturnType<typeof createInterface>,
   handleSlash: (raw: string) => Promise<boolean>
@@ -613,6 +665,15 @@ async function showCommandPicker(
         { cmd: '/sessions', desc: 'list past session log files' },
       ],
     },
+    {
+      label: 'MCP & Permits',
+      entries: [
+        { cmd: '/mcp-list', desc: 'list connected MCP tools' },
+        { cmd: '/permits', desc: 'list auto-approval permit rules' },
+        { cmd: '/pr-watch', desc: 'watch a GitHub PR for changes' },
+        { cmd: '/pr-unwatch', desc: 'stop all PR watchers' },
+      ],
+    },
   ];
 
   console.log('');
@@ -659,6 +720,7 @@ async function runTrident(
     codexModel?: string;
     codexTimeout?: string;
     thinking?: boolean;
+    output?: string;
   }
 ): Promise<void> {
   let config: TridentConfig;
@@ -774,24 +836,94 @@ async function runTrident(
 
   await ensureProviderReady(provider);
 
+  // Load MCP clients
+  const mcpClients: MCPClient[] = [];
+  const mcpTools: MCPToolDefinition[] = [];
+  try {
+    const mcpCfg = await loadMCPConfig();
+    for (const serverCfg of mcpCfg.servers) {
+      try {
+        const client = new MCPClient(serverCfg);
+        await client.initialize();
+        const tools = client.getTools();
+        mcpClients.push(client);
+        mcpTools.push(...tools);
+      } catch {
+        // Non-fatal: continue without this MCP server
+      }
+    }
+  } catch {
+    // Non-fatal: MCP config load failed
+  }
+
+  // Load permit rules
+  let permitRules: Array<{ tool: string; pattern?: string; description?: string }> = [];
+  try {
+    const { loadPermitRules } = await import('./warden/index.js') as {
+      loadPermitRules?: () => Promise<Array<{ tool: string; pattern?: string; description?: string }>>;
+    };
+    if (typeof loadPermitRules === 'function') {
+      permitRules = await loadPermitRules();
+    }
+  } catch {
+    // warden may not export loadPermitRules yet
+  }
+
+  // Build MCP tool section for system prompt injection
+  const buildMcpSystemPromptSection = (): string => {
+    if (mcpTools.length === 0) return '';
+    const lines = [
+      '\n\n## MCP Tools Available',
+      'The following MCP (Model Context Protocol) tools are available via connected servers:',
+    ];
+    for (const tool of mcpTools) {
+      lines.push(`\n### ${tool.name}`);
+      lines.push(tool.description);
+    }
+    return lines.join('\n');
+  };
+
+  // Wrap getSystemPrompt to also inject MCP tools
+  const getSystemPromptWithMcp = (): string => {
+    return getSystemPrompt() + buildMcpSystemPromptSection();
+  };
+
+  // Determine output mode
+  const outputFormat: 'pretty' | 'json' = cliOpts?.output === 'json'
+    ? 'json'
+    : (!process.stdout.isTTY && !process.stdin.isTTY ? 'json' : 'pretty');
+
   if (initialTask) {
     if (hooks.on_task_start) await runHook(hooks.on_task_start, cwd);
-    await executeTask(initialTask, {
+    const { expanded: expandedTask } = await expandAtReferences(initialTask, cwd);
+    const result = await executeTask(expandedTask, {
       model,
       mode,
       provider,
       maxTurns,
       budgetUsd,
       logSessions: config.logSessions,
-      systemPrompt: getSystemPrompt(),
+      systemPrompt: getSystemPromptWithMcp(),
       profile: activeProfile,
       codexTimeoutMs,
       cwd,
       askUserFn,
       thinking: cliOpts?.thinking ?? false,
       hooks,
+      outputMode: outputFormat,
+      mcpClients,
     });
     if (hooks.on_task_end) await runHook(hooks.on_task_end, cwd);
+    for (const client of mcpClients) client.destroy();
+    if (outputFormat === 'json' && result) {
+      process.stdout.write(JSON.stringify({
+        success: result.success,
+        summary: result.summary,
+        cost: result.totalCost,
+        tokens: result.totalTokens,
+        turns: result.turns,
+      }, null, 2) + '\n');
+    }
     return;
   }
 
@@ -820,6 +952,7 @@ async function runTrident(
   const taskHistory: Array<{ task: string; summary: string; cost: number }> = [];
   const turnCostLog: Array<{ taskIdx: number; turn: number; cost: number }> = [];
   const backgroundTasks: BackgroundTask[] = [];
+  const prWatchers: PRWatcher[] = [];
   let lastTask: string | null = null;
 
   const handleSlash = async (raw: string): Promise<boolean> => {
@@ -926,7 +1059,7 @@ async function runTrident(
           maxTurns,
           budgetUsd: remainingBudget(session),
           logSessions: config.logSessions,
-          systemPrompt: getSystemPrompt(),
+          systemPrompt: getSystemPromptWithMcp(),
           profile: activeProfile,
           codexTimeoutMs,
           cwd,
@@ -936,6 +1069,7 @@ async function runTrident(
           autoFormat: session.autoFormat,
           planMode: session.planMode,
           thinking: session.thinking,
+          mcpClients,
         });
         if (result) {
           session.cost += result.totalCost;
@@ -1727,6 +1861,175 @@ async function runTrident(
         return true;
       }
 
+      case 'mcp-list': {
+        if (mcpTools.length === 0) {
+          printInfo('No MCP tools available. Add servers to ~/.trident/mcp.json to connect MCP servers.');
+          return true;
+        }
+        console.log('');
+        console.log('  ' + chalk.hex('#5EEAD4').bold('MCP Tools'));
+        for (const tool of mcpTools) {
+          console.log(`    ${chalk.white(tool.name.padEnd(30))} ${chalk.hex('#94A3B8').dim(tool.description.slice(0, 60))}`);
+        }
+        console.log('');
+        return true;
+      }
+
+      case 'mcp-call': {
+        // Usage: /mcp-call <server__toolname> <json-input>
+        const spaceIdx = arg.indexOf(' ');
+        if (!arg || spaceIdx === -1) {
+          printError('Usage: /mcp-call <server__toolname> <json-input>');
+          return true;
+        }
+        const toolName = arg.slice(0, spaceIdx).trim();
+        const jsonInput = arg.slice(spaceIdx + 1).trim();
+        const mcpClient = mcpClients.find(c => toolName.startsWith(c.getServerName() + '__'));
+        if (!mcpClient) {
+          printError(`No MCP client found for tool: ${toolName}`);
+          printInfo(`Available tools: ${mcpTools.map(t => t.name).join(', ')}`);
+          return true;
+        }
+        let mcpInput: Record<string, unknown>;
+        try {
+          mcpInput = JSON.parse(jsonInput) as Record<string, unknown>;
+        } catch {
+          printError('Invalid JSON input. Usage: /mcp-call <server__toolname> {"key":"value"}');
+          return true;
+        }
+        try {
+          printInfo(`Calling MCP tool: ${toolName}...`);
+          const mcpResult = await mcpClient.callTool(toolName, mcpInput);
+          console.log('');
+          console.log(chalk.hex('#94A3B8')(mcpResult));
+          console.log('');
+        } catch (err) {
+          printError(`MCP call failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        return true;
+      }
+
+      case 'permits': {
+        if (permitRules.length === 0) {
+          printInfo('No permit rules. Add one with /permit <tool> [pattern]');
+        } else {
+          console.log('');
+          console.log('  ' + chalk.hex('#5EEAD4').bold('Permit rules'));
+          permitRules.forEach((r, i) => {
+            console.log(`    ${chalk.dim(String(i + 1) + '.')} ${chalk.white(r.tool.padEnd(16))} ${chalk.dim(r.pattern || '(any input)')} ${r.description ? chalk.hex('#94A3B8')(r.description) : ''}`);
+          });
+          console.log('');
+        }
+        return true;
+      }
+
+      case 'permit': {
+        const [permitTool, permitPattern, ...permitDescParts] = arg.split(/\s+/);
+        if (!permitTool) {
+          printError('Usage: /permit <tool> [regex-pattern] [description]');
+          return true;
+        }
+        try {
+          const wardenMod = await import('./warden/index.js') as {
+            savePermitRule?: (rule: { tool: string; pattern?: string; description?: string }) => Promise<void>;
+            loadPermitRules?: () => Promise<Array<{ tool: string; pattern?: string; description?: string }>>;
+          };
+          if (typeof wardenMod.savePermitRule === 'function') {
+            await wardenMod.savePermitRule({
+              tool: permitTool,
+              pattern: permitPattern || undefined,
+              description: permitDescParts.join(' ') || undefined,
+            });
+          }
+          if (typeof wardenMod.loadPermitRules === 'function') {
+            permitRules = await wardenMod.loadPermitRules();
+          } else {
+            permitRules.push({ tool: permitTool, pattern: permitPattern || undefined, description: permitDescParts.join(' ') || undefined });
+          }
+          printSuccess(`Permit rule added: ${permitTool}${permitPattern ? ' matching ' + permitPattern : ' (any input)'}`);
+        } catch (err) {
+          printError(`Failed to save permit rule: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        return true;
+      }
+
+      case 'pr-watch': {
+        // Usage: /pr-watch owner/repo#123  or  /pr-watch 123 (uses GITHUB_REPOSITORY env)
+        if (!arg) {
+          printError('Usage: /pr-watch <owner/repo#number>');
+          return true;
+        }
+        const prMatch = arg.match(/^(?:([\w.-]+)\/([\w.-]+))?#?(\d+)$/);
+        if (!prMatch) {
+          printError('Usage: /pr-watch <owner/repo#number>  e.g.  anthropic/claude#42');
+          return true;
+        }
+        let prOwner = prMatch[1];
+        let prRepo = prMatch[2];
+        const prNumber = parseInt(prMatch[3], 10);
+        if (!prOwner || !prRepo) {
+          const envRepo = process.env.GITHUB_REPOSITORY || '';
+          const parts = envRepo.split('/');
+          if (parts.length === 2) {
+            prOwner = parts[0];
+            prRepo = parts[1];
+          } else {
+            printError('Could not determine repo. Provide owner/repo#number or set GITHUB_REPOSITORY env var.');
+            return true;
+          }
+        }
+        const ghToken = process.env.GITHUB_TOKEN;
+        try {
+          const prState = await fetchPRState(prOwner, prRepo, prNumber, ghToken);
+          printInfo(`Watching PR #${prNumber}: ${prState.title} [${prState.state}]`);
+          printInfo(`CI: ${prState.ciStatus}  |  Comments: ${prState.commentCount}  |  Mergeable: ${prState.mergeable ?? 'unknown'}`);
+          const prIntervalHandle = setInterval(async () => {
+            try {
+              const newPrState = await fetchPRState(prOwner, prRepo, prNumber, ghToken);
+              const watcher = prWatchers.find(w => w.owner === prOwner && w.repo === prRepo && w.prNumber === prNumber);
+              if (!watcher) return;
+              if (newPrState.commentCount > watcher.lastCommentCount) {
+                printInfo(`[PR #${prNumber}] New comment: ${(newPrState.lastCommentBody || '').slice(0, 120)}`);
+                watcher.lastCommentCount = newPrState.commentCount;
+              }
+              if (newPrState.ciStatus !== watcher.lastCiStatus) {
+                printInfo(`[PR #${prNumber}] CI status changed: ${watcher.lastCiStatus} -> ${newPrState.ciStatus}`);
+                watcher.lastCiStatus = newPrState.ciStatus;
+              }
+            } catch {
+              // ignore polling errors
+            }
+          }, 60000);
+          const prWatcher: PRWatcher = {
+            owner: prOwner,
+            repo: prRepo,
+            prNumber,
+            intervalHandle: prIntervalHandle,
+            lastCommentCount: prState.commentCount,
+            lastCiStatus: prState.ciStatus,
+            token: ghToken,
+          };
+          prWatchers.push(prWatcher);
+          printSuccess(`PR watcher started for ${prOwner}/${prRepo}#${prNumber} (polling every 60s)`);
+        } catch (err) {
+          printError(`Failed to fetch PR state: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        return true;
+      }
+
+      case 'pr-unwatch': {
+        if (prWatchers.length === 0) {
+          printInfo('No active PR watchers.');
+          return true;
+        }
+        for (const w of prWatchers) {
+          clearInterval(w.intervalHandle);
+        }
+        prWatchers.length = 0;
+        printSuccess('All PR watchers stopped.');
+        return true;
+      }
+
       default:
         printWarn(`Unknown command: /${head}. Type / then Enter for the menu, or /help for the list.`);
         return true;
@@ -1805,15 +2108,18 @@ async function runTrident(
 
     if (hooks.on_task_start) await runHook(hooks.on_task_start, cwd);
 
+    // Expand @filepath references before sending to agent
+    const { expanded: expandedTask } = await expandAtReferences(task, cwd);
+
     const taskIdx = taskHistory.length;
-    const result = await executeTask(task, {
+    const result = await executeTask(expandedTask, {
       model: session.model,
       mode: session.mode,
       provider: session.provider,
       maxTurns,
       budgetUsd: remainingBudget(session),
       logSessions: config.logSessions,
-      systemPrompt: getSystemPrompt(),
+      systemPrompt: getSystemPromptWithMcp(),
       profile: activeProfile,
       codexTimeoutMs,
       cwd,
@@ -1823,6 +2129,7 @@ async function runTrident(
       autoFormat: session.autoFormat,
       planMode: session.planMode,
       thinking: session.thinking,
+      mcpClients,
     });
 
     if (hooks.on_task_end) await runHook(hooks.on_task_end, cwd);
@@ -1856,6 +2163,14 @@ async function runTrident(
   }
 
   rl.on('close', () => {
+    // Clean up PR watchers
+    for (const w of prWatchers) {
+      clearInterval(w.intervalHandle);
+    }
+    // Clean up MCP clients
+    for (const client of mcpClients) {
+      client.destroy();
+    }
     console.log(chalk.hex('#5EEAD4')('\nsigning off.\n'));
     process.exit(0);
   });
@@ -1881,14 +2196,22 @@ async function executeTask(
     planMode?: boolean;
     thinking?: boolean;
     hooks?: HooksConfig;
+    outputMode?: 'pretty' | 'json';
+    mcpClients?: MCPClient[];
   }
 ): Promise<Awaited<ReturnType<typeof runAgentLoop>> | null> {
-  printSectionHeader(`FORGE - ${opts.provider} - ${opts.model}`);
-  console.log(chalk.dim(`  ${task}`));
-  console.log('');
+  const jsonMode = opts.outputMode === 'json';
+
+  if (!jsonMode) {
+    printSectionHeader(`FORGE - ${opts.provider} - ${opts.model}`);
+    console.log(chalk.dim(`  ${task}`));
+    console.log('');
+  }
 
   if (opts.provider === 'codex') {
-    printInfo(`Running Codex CLI${opts.profile ? ` with ${opts.profile.name}` : ''} (${opts.mode} -> ${codexSandboxForMode(opts.mode)} sandbox).`);
+    if (!jsonMode) {
+      printInfo(`Running Codex CLI${opts.profile ? ` with ${opts.profile.name}` : ''} (${opts.mode} -> ${codexSandboxForMode(opts.mode)} sandbox).`);
+    }
     try {
       const codexResult = await runCodexExec({
         cwd: opts.cwd,
@@ -1907,14 +2230,18 @@ async function executeTask(
         totalTokens: { input: 0, output: 0 },
         turnCosts: [],
       };
-      printFinalSummary(result);
-      if (!codexResult.success) {
-        printWarn('Codex CLI did not complete successfully. Run "codex doctor" for details.');
+      if (!jsonMode) {
+        printFinalSummary(result);
+        if (!codexResult.success) {
+          printWarn('Codex CLI did not complete successfully. Run "codex doctor" for details.');
+        }
       }
       return result;
     } catch (err) {
-      console.log('');
-      printError(err instanceof Error ? err.message : String(err));
+      if (!jsonMode) {
+        console.log('');
+        printError(err instanceof Error ? err.message : String(err));
+      }
       return null;
     }
   }
@@ -1925,13 +2252,13 @@ async function executeTask(
   // Set up abort controller for Ctrl+C interrupt
   const abortController = new AbortController();
   const sigintHandler = () => {
-    console.log(chalk.yellow('\n  [TRIDENT] Interrupted. Stopping task...'));
+    if (!jsonMode) console.log(chalk.yellow('\n  [TRIDENT] Interrupted. Stopping task...'));
     abortController.abort();
   };
   process.once('SIGINT', sigintHandler);
 
   const onToolStart = async (call: import('./agent/tools.js').ToolCall): Promise<void> => {
-    printToolStart(call);
+    if (!jsonMode) printToolStart(call);
   };
 
   const beforeToolExecute = async (call: import('./agent/tools.js').ToolCall): Promise<void> => {
@@ -1993,19 +2320,23 @@ async function executeTask(
           process.stdout.write(chalk.hex('#F5C97A')('\n  [TRIDENT] Context approaching limit — consider /compact\n'));
         }
       },
-      onText: printAgentText,
+      onText: jsonMode ? () => {} : printAgentText,
       onToolStart,
       beforeToolExecute,
-      onToolEnd,
-      onCostUpdate: printCostUpdate,
+      onToolEnd: jsonMode ? () => {} : onToolEnd,
+      onCostUpdate: jsonMode ? () => {} : printCostUpdate,
       askUserFn: opts.askUserFn,
     });
 
-    printFinalSummary(result);
+    if (!jsonMode) {
+      printFinalSummary(result);
+    }
     return result;
   } catch (err) {
-    console.log('');
-    printError(err instanceof Error ? err.message : String(err));
+    if (!jsonMode) {
+      console.log('');
+      printError(err instanceof Error ? err.message : String(err));
+    }
     return null;
   } finally {
     process.removeListener('SIGINT', sigintHandler);
