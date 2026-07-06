@@ -3,6 +3,7 @@ import figures from 'figures';
 import type { ToolCall, ToolResult } from '../agent/tools.js';
 import type { RiskLevel } from '../warden/index.js';
 import { classifyRisk } from '../warden/index.js';
+import { SLASH_COMMAND_GROUPS } from './commands.js';
 
 const TEAL = '#5EEAD4';
 const AMBER = '#F5C97A';
@@ -104,6 +105,15 @@ export function printToolStart(call: ToolCall): void {
   lastToolStartLines = inputPreview ? 2 : 1;
 }
 
+/**
+ * Call when output has been printed between printToolStart and printToolEnd
+ * (diff previews, approval prompts) so printToolEnd does not rewind the cursor
+ * over lines that no longer belong to the tool-start banner.
+ */
+export function resetToolLineTracking(): void {
+  lastToolStartLines = 0;
+}
+
 export function printToolEnd(call: ToolCall, result: ToolResult): void {
   if (lastToolStartLines > 0) {
     process.stdout.write(`\x1b[${lastToolStartLines}A`);
@@ -180,12 +190,6 @@ export function printWarn(message: string): void {
   console.log(`  ${chalk.hex(AMBER)(figures.warning)} ${chalk.hex(AMBER)(message)}`);
 }
 
-export function printCostUpdate(cost: number, tokens: { input: number; output: number }): void {
-  const costStr = `$${cost.toFixed(4)}`;
-  const tokenStr = `${(tokens.input + tokens.output).toLocaleString()} tok`;
-  process.stdout.write(`\r  ${chalk.hex(SLATE).dim('-')} ${chalk.hex(AMBER)(costStr)}  ${chalk.hex(SLATE).dim(tokenStr)}      `);
-}
-
 export function printFinalSummary(result: {
   summary: string;
   turns: number;
@@ -242,8 +246,11 @@ export function printPrompt(): void {
   process.stdout.write('\n' + chalk.hex(TEAL).bold('TRIDENT ') + chalk.hex(SLATE)('> '));
 }
 
-export function printWelcome(): void {
-  console.log(chalk.hex(SLATE)('  ready - type a task or '), chalk.white('/help'), chalk.hex(SLATE)(' for commands'));
+export function printWelcome(userName?: string): void {
+  const greeting = userName && userName.trim() && userName.trim() !== 'Operator'
+    ? `ready, ${userName.trim()} - type a task or `
+    : 'ready - type a task or ';
+  console.log(chalk.hex(SLATE)('  ' + greeting), chalk.white('/help'), chalk.hex(SLATE)(' for commands'));
   console.log('');
 }
 
@@ -251,63 +258,17 @@ export function printSlashHelp(): void {
   console.log('');
   console.log('  ' + chalk.hex(TEAL).bold('Slash commands') + chalk.hex(SLATE).dim('  (press / then Enter for the menu)'));
 
-  const groups: Array<{ label: string; cmds: [string, string][] }> = [
-    {
-      label: 'Session',
-      cmds: [
-        ['/help', 'show this help'],
-        ['/status', 'show model / provider / mode / cost'],
-        ['/cost', 'show running cost and token totals'],
-        ['/history', 'show tasks run this session'],
-        ['/clear', 'clear the screen'],
-        ['/exit', 'quit (or Ctrl+C)'],
-      ],
-    },
-    {
-      label: 'Agent',
-      cmds: [
-        ['/retry', 're-run the last task'],
-        ['/undo', 'revert last file write or edit'],
-        ['/save [file]', 'save session transcript to a file'],
-        ['/compact', 'summarize and trim session history'],
-        ['/budget [usd|clear]', 'show, set, or clear the session budget'],
-        ['/profile [name|clear]', 'show or switch trained profile'],
-        ['/profiles', 'list trained profiles'],
-        ['/override [text|clear]', 'show or set system override'],
-      ],
-    },
-    {
-      label: 'Project',
-      cmds: [
-        ['/init', 'generate TRIDENT.md for the current project'],
-        ['/context', 'show current TRIDENT.md contents'],
-        ['/tree', 'show project file tree'],
-        ['/cwd', 'show working directory'],
-      ],
-    },
-    {
-      label: 'Config',
-      cmds: [
-        ['/model <name>', 'switch model (slash in name -> OpenRouter)'],
-        ['/provider <name>', 'switch provider - anthropic | openrouter | codex'],
-        ['/mode <name>', 'switch approval mode - yolo | review | lockdown'],
-        ['/yolo', 'shortcut for /mode yolo'],
-        ['/safe', 'shortcut for /mode review'],
-        ['/lock', 'shortcut for /mode lockdown'],
-        ['/models', 'list available models'],
-        ['/sessions', 'list past session log files'],
-      ],
-    },
-  ];
+  const display = (cmd: { cmd: string; args?: string }): string =>
+    cmd.args ? `${cmd.cmd} ${cmd.args}` : cmd.cmd;
 
-  const allCmds = groups.flatMap((g) => g.cmds);
-  const pad = Math.max(...allCmds.map((c) => c[0].length));
+  const allCmds = SLASH_COMMAND_GROUPS.flatMap((g) => g.commands);
+  const pad = Math.max(...allCmds.map((c) => display(c).length));
 
-  for (const { label, cmds } of groups) {
+  for (const { label, commands } of SLASH_COMMAND_GROUPS) {
     console.log('');
     console.log('  ' + chalk.hex(AMBER).dim(label));
-    for (const [cmd, description] of cmds) {
-      console.log('    ' + chalk.hex(TEAL)(cmd.padEnd(pad + 2)) + chalk.hex(SLATE)(description));
+    for (const command of commands) {
+      console.log('    ' + chalk.hex(TEAL)(display(command).padEnd(pad + 2)) + chalk.hex(SLATE)(command.desc));
     }
   }
 
@@ -378,5 +339,3 @@ function truncate(s: string, max: number): string {
   }
   return s.length > max ? s.slice(0, max - 3) + '...' : s;
 }
-
-export const theme = { TEAL, AMBER, ROSE, SLATE, SEA };

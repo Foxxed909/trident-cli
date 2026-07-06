@@ -1,8 +1,9 @@
 import chalk from 'chalk';
 import { createDiffView } from '../ui/diff.js';
+import { resetToolLineTracking } from '../ui/renderer.js';
 import { streamCompletion, calculateCost } from '../providers/anthropic.js';
 import { streamOpenRouter, calculateOpenRouterCost } from '../providers/openrouter.js';
-import { executeTool, TOOL_DEFINITIONS, resolveWorkspacePath, type ToolCall, type ToolResult } from './tools.js';
+import { executeTool, applyEdits, TOOL_DEFINITIONS, resolveWorkspacePath, type ToolCall, type ToolResult } from './tools.js';
 import { classifyRisk, requestApproval, SessionLogger } from '../warden/index.js';
 import type { ChatMessage } from '../providers/anthropic.js';
 import type { ApprovalMode } from '../warden/index.js';
@@ -68,14 +69,14 @@ export async function runAgentLoop(
         const stream = isOpenRouter
           ? streamOpenRouter(messages, {
               model: opts.model,
-              maxTokens: 8096,
+              maxTokens: 8192,
               systemPrompt: opts.systemPrompt,
               tools: TOOL_DEFINITIONS,
               apiKey: process.env.OPENROUTER_API_KEY || '',
             })
           : streamCompletion(messages, {
               model: opts.model,
-              maxTokens: 8096,
+              maxTokens: 8192,
               systemPrompt: opts.systemPrompt,
               tools: TOOL_DEFINITIONS,
             });
@@ -138,17 +139,24 @@ export async function runAgentLoop(
     }
 
     const finalAnswerCall = pendingToolCalls.find((tc) => tc.name === 'final_answer');
-    if (finalAnswerCall || pendingToolCalls.length === 0) {
-      if (finalAnswerCall) {
-        finalSummary = (finalAnswerCall.input.summary as string) || 'Task completed.';
-        finalAnswerFound = true;
+
+    if (pendingToolCalls.length === 0) {
+      // The model finished with a plain-text answer instead of final_answer.
+      // That is still a natural completion, not a failure.
+      if (assistantText.trim()) {
+        finalSummary = assistantText.trim().slice(0, 1000);
       }
+      finalAnswerFound = true;
       break;
     }
 
     const toolResults: Array<{ type: 'tool_result'; tool_use_id: string; content: string }> = [];
 
-    for (const tc of pendingToolCalls) {
+    // Execute every non-final tool call first so that a final_answer issued in
+    // the same turn as a write/edit does not silently drop those actions.
+    const executableCalls = pendingToolCalls.filter((tc) => tc.name !== 'final_answer');
+
+    for (const tc of executableCalls) {
       const call: ToolCall = { name: tc.name, input: tc.input };
       const risk = classifyRisk(call);
 
@@ -156,8 +164,17 @@ export async function runAgentLoop(
         await opts.onToolStart(call);
       }
 
+      let printedBetween = false;
       if (call.name === 'write_file' || call.name === 'edit_file') {
-        await showDiffPreview(call, opts.cwd);
+        printedBetween = await showDiffPreview(call, opts.cwd);
+      }
+
+      const willPrompt =
+        opts.mode === 'lockdown' || (opts.mode === 'review' && risk !== 'read');
+      if (printedBetween || willPrompt) {
+        // Output appeared between tool-start and tool-end lines, so the
+        // renderer must not rewind the cursor over it.
+        resetToolLineTracking();
       }
 
       const approved = await requestApproval(call, opts.mode, risk);
@@ -199,6 +216,12 @@ export async function runAgentLoop(
       });
     }
 
+    if (finalAnswerCall) {
+      finalSummary = (finalAnswerCall.input.summary as string) || 'Task completed.';
+      finalAnswerFound = true;
+      break;
+    }
+
     messages.push({ role: 'user', content: toolResults as unknown as ChatMessage['content'] });
   }
 
@@ -219,7 +242,7 @@ export async function runAgentLoop(
   };
 }
 
-async function showDiffPreview(call: ToolCall, cwd: string): Promise<void> {
+async function showDiffPreview(call: ToolCall, cwd: string): Promise<boolean> {
   const { readFile } = await import('fs/promises');
 
   if (call.name === 'write_file') {
@@ -232,8 +255,9 @@ async function showDiffPreview(call: ToolCall, cwd: string): Promise<void> {
       console.log('');
       console.log(chalk.dim(`--- Diff: ${filePath} ---`));
       console.log(createDiffView(oldContent, content));
+      return true;
     }
-    return;
+    return false;
   }
 
   if (call.name === 'edit_file') {
@@ -242,21 +266,18 @@ async function showDiffPreview(call: ToolCall, cwd: string): Promise<void> {
     try {
       originalContent = await readFile(resolveWorkspacePath(cwd, filePath), 'utf-8');
     } catch {
-      return;
+      return false;
     }
 
-    let newContent = originalContent;
-    for (const edit of edits) {
-      const idx = newContent.indexOf(edit.old_str);
-      if (idx !== -1) {
-        newContent = newContent.slice(0, idx) + edit.new_str + newContent.slice(idx + edit.old_str.length);
-      }
-    }
+    const { content: newContent } = applyEdits(originalContent, edits);
 
     if (newContent !== originalContent) {
       console.log('');
       console.log(chalk.dim(`--- Diff: ${filePath} ---`));
       console.log(createDiffView(originalContent, newContent));
+      return true;
     }
   }
+
+  return false;
 }

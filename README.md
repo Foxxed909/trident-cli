@@ -140,7 +140,7 @@ Plain text without a leading `/` is sent to the agent as a task.
 
 | Mode | Description |
 |---|---|
-| `review` | Auto-approve reads; confirm writes, commands, and destructive actions |
+| `review` | Auto-approve reads; confirm writes, commands, web fetches, and destructive actions |
 | `yolo` | Auto-approve everything |
 | `lockdown` | Confirm every action |
 
@@ -265,7 +265,9 @@ trident/
 
 ## Notes
 
-- Tool execution is restricted to the current workspace root.
+- Tool execution is restricted to the current workspace root, including symlink targets.
+- `web_fetch` counts as an execute-level action (it can send data to arbitrary URLs), so review mode asks before fetching.
+- Unknown model ids are billed at a Sonnet-tier fallback rate for budget tracking, so budgets stay enforced.
 - Session budgets are enforced during agent runs.
 - Provider switching in interactive mode checks that the required API key is present before a request is sent.
 - Codex provider runs through `codex exec` with a timeout and captures the final Codex message.

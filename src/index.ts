@@ -12,6 +12,9 @@ import { readFile as fsReadFile, writeFile as fsWriteFile, unlink as fsUnlink } 
 
 import { getConfig, getRawConfig, getDefaultConfig, resetConfigToDefaults, setConfig, deleteConfig, getConfigPath, ConfigSchema } from './config.js';
 import type { TridentConfig } from './config.js';
+import { formatEnvAssignment } from './util.js';
+import { ANTHROPIC_PRICING } from './providers/anthropic.js';
+import { SLASH_COMMAND_GROUPS } from './ui/commands.js';
 import { runOnboarding } from './ui/onboarding.js';
 import { loadOrCreateContext, generateTridentMd, buildSystemPrompt, generateProjectTree } from './oracle/index.js';
 import { runAgentLoop, type ProviderName as AgentProviderName } from './agent/loop.js';
@@ -53,7 +56,7 @@ program
   .option('-m, --model <model>', 'Model to use')
   .option('-p, --provider <provider>', 'Provider: anthropic | openrouter | codex')
   .option('--mode <mode>', 'Approval mode: yolo | review | lockdown')
-  .option('--max-turns <n>', 'Max agent loop iterations', '50')
+  .option('--max-turns <n>', 'Max agent loop iterations (default: config maxTurns)')
   .option('--budget <usd>', 'Max budget in USD')
   .option('--profile <name>', `Trained profile: ${formatProfileNames()}`)
   .option('--system-override <text>', 'Operator system override appended to the agent prompt')
@@ -249,9 +252,6 @@ program
         const issue = validated.error.issues[0];
         const path = issue.path.length > 0 ? issue.path.join('.') : key;
         console.log(chalk.red(`Invalid value for ${path}: ${issue.message}`));
-        if (key === 'theme') {
-          console.log(chalk.dim('Example: trident config theme {"primary":"#00D4FF","accent":"#FFD700","danger":"#FF4444"}'));
-        }
         process.exit(1);
       }
 
@@ -414,7 +414,6 @@ program
       return;
     }
 
-    const latest = files[0];
     const loaded = await loadLatestReviewableSession(files);
     if (!loaded) {
       printError('No readable session logs found.');
@@ -541,51 +540,6 @@ async function showCommandPicker(
   const SLATE = '#94A3B8';
   const AMBER = '#F5C97A';
 
-  const groups: Array<{ label: string; entries: Array<{ cmd: string; desc: string }> }> = [
-    {
-      label: 'Session',
-      entries: [
-        { cmd: '/help', desc: 'show all slash commands' },
-        { cmd: '/status', desc: 'model / provider / mode / cost' },
-        { cmd: '/history', desc: 'tasks run this session' },
-        { cmd: '/clear', desc: 'clear the screen' },
-        { cmd: '/exit', desc: 'quit trident' },
-      ],
-    },
-    {
-      label: 'Agent',
-      entries: [
-        { cmd: '/retry', desc: 're-run the last task' },
-        { cmd: '/undo', desc: 'revert last file write or edit' },
-        { cmd: '/compact', desc: 'trim session history and undo stack' },
-        { cmd: '/save', desc: 'save session transcript to a .md file' },
-        { cmd: '/budget', desc: 'show, set, or clear session budget' },
-        { cmd: '/profile', desc: 'show or switch trained profile' },
-        { cmd: '/override', desc: 'show or set system override' },
-      ],
-    },
-    {
-      label: 'Project',
-      entries: [
-        { cmd: '/init', desc: 'generate TRIDENT.md' },
-        { cmd: '/context', desc: 'show TRIDENT.md contents' },
-        { cmd: '/tree', desc: 'show project file tree' },
-        { cmd: '/cwd', desc: 'show working directory' },
-      ],
-    },
-    {
-      label: 'Config',
-      entries: [
-        { cmd: '/yolo', desc: 'mode -> YOLO (approve all)' },
-        { cmd: '/safe', desc: 'mode -> REVIEW (confirm writes)' },
-        { cmd: '/lock', desc: 'mode -> LOCKDOWN (confirm everything)' },
-        { cmd: '/models', desc: 'list available models' },
-        { cmd: '/profiles', desc: 'list trained profiles' },
-        { cmd: '/sessions', desc: 'list past session log files' },
-      ],
-    },
-  ];
-
   console.log('');
   console.log('  ' + chalk.hex(TEAL).bold('Command menu'));
   console.log('');
@@ -593,9 +547,13 @@ async function showCommandPicker(
   let n = 1;
   const numToCmd: Record<number, string> = {};
 
-  for (const { label, entries } of groups) {
+  for (const { label, commands } of SLASH_COMMAND_GROUPS) {
+    const pickable = commands.filter((c) => !c.requiresArg && !c.aliasOf);
+    if (pickable.length === 0) {
+      continue;
+    }
     console.log('  ' + chalk.hex(AMBER).dim(`-- ${label} --`));
-    for (const { cmd, desc } of entries) {
+    for (const { cmd, desc } of pickable) {
       numToCmd[n] = cmd;
       const num = chalk.hex(SLATE).dim(String(n).padStart(2));
       const cmdStr = chalk.hex(TEAL)(cmd.padEnd(12));
@@ -737,7 +695,7 @@ async function runTrident(
     return;
   }
 
-  printWelcome();
+  printWelcome(config.userName);
 
   const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
   const session = {
@@ -1270,7 +1228,14 @@ async function executeTask(
       return;
     }
 
-    const filePath = resolveWorkspacePath(opts.cwd, call.input.path as string);
+    // A bad path must not abort the whole agent run here; executeTool will
+    // reject it and report a tool error to the model instead.
+    let filePath: string;
+    try {
+      filePath = resolveWorkspacePath(opts.cwd, call.input.path as string);
+    } catch {
+      return;
+    }
     let originalContent: string | null = null;
     try {
       originalContent = await fsReadFile(filePath, 'utf-8');
@@ -1295,7 +1260,6 @@ async function executeTask(
       onToolStart,
       beforeToolExecute,
       onToolEnd: printToolEnd,
-      onCostUpdate: () => {},
       askUserFn: opts.askUserFn,
     });
 
@@ -1376,24 +1340,12 @@ function resolveConfiguredProfile(cliProfile?: string, configProfile?: string): 
   return profile;
 }
 
-function formatEnvAssignment(key: string, value: string): string {
-  if (process.platform === 'win32') {
-    return `$env:${key}="${value}"`;
-  }
-  return `export ${key}=${value}`;
-}
-
 function printAvailableModels(): void {
   console.log(chalk.hex('#00D4FF').bold('\nTRIDENT - Available Models\n'));
 
   console.log(chalk.bold('  ANTHROPIC (--provider anthropic)'));
-  const anthropicModels = [
-    ['claude-opus-4-7', '$15 / $75 per M tokens'],
-    ['claude-sonnet-4-6', '$3  / $15 per M tokens'],
-    ['claude-haiku-4-5-20251001', '$0.25 / $1.25 per M tokens'],
-  ];
-  for (const [m, p] of anthropicModels) {
-    console.log(`    ${chalk.white(m.padEnd(38))} ${chalk.dim(p)}`);
+  for (const [m, p] of Object.entries(ANTHROPIC_PRICING)) {
+    console.log(`    ${chalk.white(m.padEnd(38))} ${chalk.dim(`$${p.input} / $${p.output} per M tokens`)}`);
   }
 
   console.log('');

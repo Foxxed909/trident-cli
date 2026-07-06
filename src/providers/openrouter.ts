@@ -177,21 +177,7 @@ export async function* streamOpenRouter(
       const data = line.slice(6).trim();
       if (data === '[DONE]') {
         receivedDone = true;
-        if (latestUsage) {
-          yield { type: 'usage', usage: latestUsage };
-        }
-        // Flush any accumulated tool calls
-        for (const tc of Object.values(toolCallAccumulators)) {
-          try {
-            const input = JSON.parse(tc.arguments || '{}');
-            yield {
-              type: 'tool_call',
-              toolCall: { id: tc.id || `tool_${Date.now()}`, name: tc.name as ToolCall['name'], input },
-            };
-          } catch {
-            // Malformed tool args
-          }
-        }
+        yield* flushStreamTail(latestUsage, toolCallAccumulators);
         yield { type: 'done' };
         return;
       }
@@ -234,22 +220,30 @@ export async function* streamOpenRouter(
 
   // Stream ended without a [DONE] line — flush any buffered tool calls and signal an error
   if (!receivedDone) {
-    if (latestUsage) {
-      yield { type: 'usage', usage: latestUsage };
-    }
-    for (const tc of Object.values(toolCallAccumulators)) {
-      try {
-        const input = JSON.parse(tc.arguments || '{}');
-        yield {
-          type: 'tool_call',
-          toolCall: { id: tc.id || `tool_${Date.now()}`, name: tc.name as ToolCall['name'], input },
-        };
-      } catch {
-        // Malformed tool args
-      }
-    }
+    yield* flushStreamTail(latestUsage, toolCallAccumulators);
     yield { type: 'text', text: '\n[OpenRouter stream ended unexpectedly without [DONE]]' };
     yield { type: 'done' };
+  }
+}
+
+// Emit final usage stats and any accumulated tool calls at end of stream.
+function* flushStreamTail(
+  latestUsage: { inputTokens: number; outputTokens: number } | null,
+  toolCallAccumulators: Record<number, { id: string; name: string; arguments: string }>
+): Generator<StreamChunk> {
+  if (latestUsage) {
+    yield { type: 'usage', usage: latestUsage };
+  }
+  for (const tc of Object.values(toolCallAccumulators)) {
+    try {
+      const input = JSON.parse(tc.arguments || '{}');
+      yield {
+        type: 'tool_call',
+        toolCall: { id: tc.id || `tool_${Date.now()}`, name: tc.name as ToolCall['name'], input },
+      };
+    } catch {
+      // Malformed tool args
+    }
   }
 }
 
