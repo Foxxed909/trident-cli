@@ -8,11 +8,6 @@ export const ConfigSchema = z.object({
   mode: z.enum(['yolo', 'review', 'lockdown']).default('review'),
   maxTurns: z.number().int().positive().default(50),
   budgetUsd: z.number().positive().optional(),
-  theme: z.object({
-    primary: z.string().default('#00D4FF'),
-    accent: z.string().default('#FFD700'),
-    danger: z.string().default('#FF4444'),
-  }).default({}),
   logSessions: z.boolean().default(true),
   onboarded: z.boolean().default(false),
   userName: z.string().default(''),
@@ -26,7 +21,7 @@ export type TridentConfig = z.infer<typeof ConfigSchema>;
 type RawConfig = Record<string, unknown>;
 
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
-const LEGACY_CONFIG_KEYS = new Set(['plan']);
+const LEGACY_CONFIG_KEYS = new Set(['plan', 'theme']);
 
 const store = new Conf<RawConfig>({
   projectName: 'trident-cli',

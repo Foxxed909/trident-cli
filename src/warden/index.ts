@@ -24,10 +24,14 @@ export function classifyRisk(call: ToolCall): RiskLevel {
     case 'read_file':
     case 'list_dir':
     case 'search_codebase':
-    case 'web_fetch':
     case 'ask_user':
     case 'final_answer':
       return 'read';
+
+    // web_fetch sends data to arbitrary URLs (exfiltration/SSRF channel), so it
+    // must not be auto-approved in review mode.
+    case 'web_fetch':
+      return 'execute';
 
     case 'write_file':
     case 'edit_file':
@@ -35,7 +39,22 @@ export function classifyRisk(call: ToolCall): RiskLevel {
 
     case 'run_command': {
       const cmd = ((call.input.cmd as string) || '').trim();
-      if (/(\brm\s+-rf?\b|\bdel\s+\/[sf]\b|\brmdir\b|\bformat\b|\bdrop\s+table\b|\btruncate\b|\bgit\s+reset\s+--hard\b|\bgit\s+clean\b)/i.test(cmd)) {
+      const destructivePatterns = [
+        /\brm\s+(-\w+\s+)*-\w*[rf]/i,          // rm -rf, rm -fr, rm -r -f, sudo rm -rf via word boundary
+        /\brm\s+--(recursive|force)\b/i,
+        /\bdel\s+\/[sf]\b/i,
+        /\brmdir\b/i,
+        /\bformat\b/i,
+        /\bmkfs\b/i,
+        /\bdd\s+\S*of=/i,
+        /\bdrop\s+table\b/i,
+        /\btruncate\b/i,
+        /\bgit\s+reset\s+--hard\b/i,
+        /\bgit\s+clean\b/i,
+        /\bgit\s+push\s+.*--force\b/i,
+        /\bshutdown\b|\breboot\b/i,
+      ];
+      if (destructivePatterns.some((p) => p.test(cmd))) {
         return 'destructive';
       }
       return 'execute';

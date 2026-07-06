@@ -1,6 +1,6 @@
 import { readFile, writeFile, unlink, readdir, lstat } from 'fs/promises';
-import { existsSync } from 'fs';
-import { join, resolve, relative, isAbsolute } from 'path';
+import { existsSync, realpathSync } from 'fs';
+import { dirname, resolve, relative, isAbsolute } from 'path';
 import { execa } from 'execa';
 import fg from 'fast-glob';
 
@@ -57,7 +57,6 @@ export async function executeTool(
         const { path: filePath, content } = call.input as { path: string; content: string };
         const absPath = resolveWorkspacePath(cwd, filePath);
         const { mkdirSync } = await import('fs');
-        const { dirname } = await import('path');
         mkdirSync(dirname(absPath), { recursive: true });
         await writeFile(absPath, content as string, 'utf-8');
         return { success: true, output: `Written: ${relative(cwd, absPath)}`, duration_ms: Date.now() - start };
@@ -69,19 +68,10 @@ export async function executeTool(
         if (!existsSync(absPath)) {
           return { success: false, output: '', error: `File not found: ${absPath}`, duration_ms: Date.now() - start };
         }
-        let content = await readFile(absPath, 'utf-8');
-        const warnings: string[] = [];
-        for (const edit of edits) {
-          const idx = content.indexOf(edit.old_str);
-          if (idx === -1) {
-            return { success: false, output: '', error: `String not found in file: "${edit.old_str.slice(0, 50)}..."`, duration_ms: Date.now() - start };
-          }
-          const occurrences = content.split(edit.old_str).length - 1;
-          if (occurrences > 1) {
-            warnings.push(`Warning: old_str appeared ${occurrences} times — only the first occurrence was replaced.`);
-          }
-          // Use split/join to avoid replace's $& / $1 substitution semantics
-          content = content.slice(0, idx) + edit.new_str + content.slice(idx + edit.old_str.length);
+        const original = await readFile(absPath, 'utf-8');
+        const { content, warnings, notFound } = applyEdits(original, edits);
+        if (notFound !== null) {
+          return { success: false, output: '', error: `String not found in file: "${notFound.slice(0, 50)}..."`, duration_ms: Date.now() - start };
         }
         await writeFile(absPath, content, 'utf-8');
         const baseOutput = `Edited: ${relative(cwd, absPath)} (${edits.length} edit(s))`;
@@ -271,15 +261,52 @@ export function resolveWorkspacePath(workspaceRoot: string, targetPath: string):
   const resolvedPath = resolve(workspaceRoot, targetPath);
   const relativePath = relative(resolvedRoot, resolvedPath);
 
-  if (relativePath === '') {
-    return resolvedPath;
-  }
-
-  if (relativePath.startsWith('..') || isAbsolute(relativePath)) {
+  if (relativePath !== '' && (relativePath.startsWith('..') || isAbsolute(relativePath))) {
     throw new Error(`Path escapes workspace root: ${targetPath}`);
   }
 
+  // A symlink inside the workspace can still point outside it, so compare the
+  // real locations of the root and the deepest existing ancestor of the target.
+  const realRoot = realpathSync(resolvedRoot);
+  const realExisting = realpathSync(deepestExistingAncestor(resolvedPath));
+  const realRelative = relative(realRoot, realExisting);
+  if (realRelative !== '' && (realRelative.startsWith('..') || isAbsolute(realRelative))) {
+    throw new Error(`Path escapes workspace root via symlink: ${targetPath}`);
+  }
+
   return resolvedPath;
+}
+
+function deepestExistingAncestor(path: string): string {
+  let current = path;
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  return current;
+}
+
+export function applyEdits(
+  content: string,
+  edits: EditOperation[]
+): { content: string; warnings: string[]; notFound: string | null } {
+  const warnings: string[] = [];
+  for (const edit of edits) {
+    const idx = content.indexOf(edit.old_str);
+    if (idx === -1) {
+      return { content, warnings, notFound: edit.old_str };
+    }
+    const occurrences = content.split(edit.old_str).length - 1;
+    if (occurrences > 1) {
+      warnings.push(`Warning: old_str appeared ${occurrences} times — only the first occurrence was replaced.`);
+    }
+    // Splice by index to avoid replace's $& / $1 substitution semantics
+    content = content.slice(0, idx) + edit.new_str + content.slice(idx + edit.old_str.length);
+  }
+  return { content, warnings, notFound: null };
 }
 
 export const TOOL_DEFINITIONS = [

@@ -3,6 +3,7 @@ import inquirer from 'inquirer';
 import { deleteConfig, setConfig } from '../config.js';
 import { isCodexCliAvailable } from '../providers/codex.js';
 import { listTrainedProfiles } from '../profiles.js';
+import { formatEnvAssignment, shellProfileHint } from '../util.js';
 
 const TEAL = '#5EEAD4';
 const AMBER = '#F5C97A';
@@ -11,22 +12,6 @@ const ROSE = '#F87171';
 
 function hr(char = '-', width = 60): string {
   return chalk.hex(SLATE).dim(char.repeat(width));
-}
-
-function formatEnvAssignment(key: string, value: string): string {
-  if (process.platform === 'win32') {
-    return `$env:${key}="${value}"`;
-  }
-
-  return `export ${key}=${value}`;
-}
-
-function shellProfileHint(): string {
-  if (process.platform === 'win32') {
-    return 'your PowerShell profile or system environment settings';
-  }
-
-  return 'your shell profile (~/.bashrc, ~/.zshrc, etc.)';
 }
 
 function printOnboardingLogo(): void {

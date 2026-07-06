@@ -99,7 +99,7 @@ export async function* streamCompletion(
   }
 }
 
-const PRICING: Record<string, { input: number; output: number }> = {
+export const ANTHROPIC_PRICING: Record<string, { input: number; output: number }> = {
   'claude-opus-4-7':            { input: 15,   output: 75   },
   'claude-opus-4-5':            { input: 15,   output: 75   },
   'claude-sonnet-4-6':          { input: 3,    output: 15   },
@@ -107,7 +107,11 @@ const PRICING: Record<string, { input: number; output: number }> = {
   'claude-haiku-4-5-20251001':  { input: 0.25, output: 1.25 },
 };
 
+// Unknown models fall back to Sonnet-tier pricing rather than $0 so that
+// session budgets still bind instead of being silently unenforced.
+const FALLBACK_PRICING = { input: 3, output: 15 };
+
 export function calculateCost(model: string, inputTokens: number, outputTokens: number): number {
-  const pricing = PRICING[model] || { input: 0, output: 0 };
+  const pricing = ANTHROPIC_PRICING[model] || FALLBACK_PRICING;
   return (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
 }
