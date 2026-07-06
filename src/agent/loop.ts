@@ -5,7 +5,7 @@ import { streamCompletion, calculateCost } from '../providers/anthropic.js';
 import { streamOpenRouter, calculateOpenRouterCost } from '../providers/openrouter.js';
 import { executeTool, applyEdits, TOOL_DEFINITIONS, resolveWorkspacePath, type ToolCall, type ToolResult } from './tools.js';
 import { classifyRisk, requestApproval, SessionLogger } from '../warden/index.js';
-import type { ChatMessage } from '../providers/anthropic.js';
+import type { ChatMessage, ContentBlock } from '../providers/anthropic.js';
 import type { ApprovalMode } from '../warden/index.js';
 
 export type ProviderName = 'anthropic' | 'openrouter';
@@ -20,6 +20,13 @@ export interface AgentOptions {
   budgetUsd?: number;
   logSessions: boolean;
   sessionId: string;
+  /**
+   * Persistent conversation history. When provided, the loop appends to it in
+   * place so follow-up tasks in the same session share context.
+   */
+  history?: ChatMessage[];
+  /** Paths/globs from TRIDENT.md "Do Not Touch" that writes must never modify. */
+  protectedPaths?: string[];
   onText?: (text: string) => void;
   onToolStart?: (call: ToolCall) => void | Promise<void>;
   beforeToolExecute?: (call: ToolCall) => void | Promise<void>;
@@ -41,9 +48,13 @@ export async function runAgentLoop(
   opts: AgentOptions
 ): Promise<AgentResult> {
   const logger = new SessionLogger(opts.sessionId, opts.logSessions);
-  const messages: ChatMessage[] = [{ role: 'user', content: initialTask }];
+  const messages: ChatMessage[] = opts.history ?? [];
+  appendUserText(messages, initialTask);
+  trimHistoryInPlace(messages);
 
   let turns = 0;
+  const callCounts = new Map<string, number>();
+  let loopBlocks = 0;
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
   let finalSummary = 'Task completed.';
@@ -135,6 +146,17 @@ export async function runAgentLoop(
     if (opts.budgetUsd !== undefined && runningCost >= opts.budgetUsd) {
       finalSummary = `Stopped after reaching the session budget of $${opts.budgetUsd.toFixed(2)}. Increase --budget or reduce scope to continue.`;
       budgetExceeded = true;
+      // Keep persistent history consistent: every tool_use needs a tool_result.
+      if (pendingToolCalls.length > 0) {
+        messages.push({
+          role: 'user',
+          content: pendingToolCalls.map((tc) => ({
+            type: 'tool_result',
+            tool_use_id: tc.id,
+            content: 'Not executed: session budget reached.',
+          })) as unknown as ChatMessage['content'],
+        });
+      }
       break;
     }
 
@@ -159,6 +181,25 @@ export async function runAgentLoop(
     for (const tc of executableCalls) {
       const call: ToolCall = { name: tc.name, input: tc.input };
       const risk = classifyRisk(call);
+
+      // Loop detection: an identical call repeated many times means the agent
+      // is stuck; short-circuit instead of burning budget on it.
+      const signature = `${call.name}:${JSON.stringify(call.input)}`;
+      const timesSeen = (callCounts.get(signature) || 0) + 1;
+      callCounts.set(signature, timesSeen);
+      if (timesSeen > 3) {
+        loopBlocks++;
+        const result: ToolResult = {
+          success: false,
+          output: '',
+          error: 'Loop detection: this exact tool call was already made 3 times with the same input. Change approach or call final_answer.',
+          duration_ms: 0,
+        };
+        opts.onToolEnd?.(call, result);
+        toolResults.push({ type: 'tool_result', tool_use_id: tc.id, content: JSON.stringify(result) });
+        await logger.log({ toolName: call.name, input: call.input, result, approved: false, riskLevel: risk });
+        continue;
+      }
 
       if (opts.onToolStart) {
         await opts.onToolStart(call);
@@ -200,7 +241,7 @@ export async function runAgentLoop(
         await opts.beforeToolExecute(call);
       }
 
-      const result = await executeTool(call, opts.cwd, opts.askUserFn);
+      const result = await executeTool(call, opts.cwd, opts.askUserFn, opts.protectedPaths);
       opts.onToolEnd?.(call, result);
 
       await logger.log({ toolName: call.name, input: call.input, result, approved: true, riskLevel: risk });
@@ -219,10 +260,17 @@ export async function runAgentLoop(
     if (finalAnswerCall) {
       finalSummary = (finalAnswerCall.input.summary as string) || 'Task completed.';
       finalAnswerFound = true;
+      toolResults.push({ type: 'tool_result', tool_use_id: finalAnswerCall.id, content: 'Acknowledged.' });
+      messages.push({ role: 'user', content: toolResults as unknown as ChatMessage['content'] });
       break;
     }
 
     messages.push({ role: 'user', content: toolResults as unknown as ChatMessage['content'] });
+
+    if (loopBlocks >= 6) {
+      finalSummary = 'Stopped: the agent kept repeating the same tool calls without progress. Rephrase the task or narrow the scope, then retry.';
+      break;
+    }
   }
 
   const totalCost = isOpenRouter
@@ -240,6 +288,52 @@ export async function runAgentLoop(
     totalCost,
     totalTokens: { input: totalInputTokens, output: totalOutputTokens },
   };
+}
+
+/**
+ * Append a new user task to the conversation. If the last message is already a
+ * user message (e.g. trailing tool results from a max-turns stop), merge the
+ * task in as a text block so message roles keep alternating.
+ */
+function appendUserText(messages: ChatMessage[], text: string): void {
+  const last = messages[messages.length - 1];
+  if (last && last.role === 'user') {
+    if (typeof last.content === 'string') {
+      last.content = [
+        { type: 'text', text: last.content },
+        { type: 'text', text },
+      ];
+    } else {
+      (last.content as ContentBlock[]).push({ type: 'text', text });
+    }
+    return;
+  }
+  messages.push({ role: 'user', content: text });
+}
+
+const HISTORY_KEEP_RECENT_MESSAGES = 10;
+const HISTORY_TOOL_RESULT_TRIM_AT = 2_000;
+const HISTORY_TOOL_RESULT_KEEP = 500;
+
+/**
+ * Bound long-session context growth by truncating old tool_result payloads
+ * (the bulkiest content) while leaving the recent turns untouched. The
+ * message structure itself is never altered, so tool_use/tool_result pairing
+ * stays valid for the providers.
+ */
+function trimHistoryInPlace(messages: ChatMessage[]): void {
+  const cutoff = Math.max(0, messages.length - HISTORY_KEEP_RECENT_MESSAGES);
+  for (let i = 0; i < cutoff; i++) {
+    const msg = messages[i];
+    if (msg.role !== 'user' || !Array.isArray(msg.content)) {
+      continue;
+    }
+    for (const block of msg.content as ContentBlock[]) {
+      if (block.type === 'tool_result' && typeof block.content === 'string' && block.content.length > HISTORY_TOOL_RESULT_TRIM_AT) {
+        block.content = `${block.content.slice(0, HISTORY_TOOL_RESULT_KEEP)}\n[...trimmed from session history to save context...]`;
+      }
+    }
+  }
 }
 
 async function showDiffPreview(call: ToolCall, cwd: string): Promise<boolean> {

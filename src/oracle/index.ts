@@ -241,6 +241,39 @@ ${ctx.tree}
   return content;
 }
 
+/**
+ * Extract the list of protected paths/globs from the "Do Not Touch" section of
+ * TRIDENT.md. Bullet items only; the template's italic placeholder is ignored.
+ */
+export function parseDoNotTouch(tridentMdContent: string | null): string[] {
+  if (!tridentMdContent) {
+    return [];
+  }
+
+  const patterns: string[] = [];
+  let inSection = false;
+
+  for (const line of tridentMdContent.split(/\r?\n/)) {
+    const heading = line.match(/^#{1,6}\s+(.*)$/);
+    if (heading) {
+      inSection = /do\s+not\s+touch/i.test(heading[1]);
+      continue;
+    }
+    if (!inSection) {
+      continue;
+    }
+    const item = line.match(/^\s*[-*+]\s+(.+)$/);
+    if (item) {
+      const cleaned = item[1].trim().replace(/^`+|`+$/g, '').trim();
+      if (cleaned) {
+        patterns.push(cleaned);
+      }
+    }
+  }
+
+  return patterns;
+}
+
 export function buildSystemPrompt(
   ctx: ProjectContext,
   opts: { profile?: TrainedProfile | null; systemOverride?: string } = {}

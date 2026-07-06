@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolveWorkspacePath, applyEdits } from '../dist/agent/tools.js';
+import { resolveWorkspacePath, applyEdits, isProtectedPath, executeTool } from '../dist/agent/tools.js';
+import { parseDoNotTouch } from '../dist/oracle/index.js';
 import { ConfigSchema } from '../dist/config.js';
 import { calculateCost } from '../dist/providers/anthropic.js';
 import { OPENROUTER_MODELS } from '../dist/providers/openrouter.js';
@@ -85,4 +86,54 @@ test('risk classification treats web_fetch as execute and catches rm variants', 
 test('unknown Anthropic models fall back to nonzero pricing so budgets bind', () => {
   assert.ok(calculateCost('some-future-model', 1_000_000, 0) > 0);
   assert.equal(calculateCost('claude-haiku-4-5-20251001', 1_000_000, 0), 0.25);
+});
+
+test('parseDoNotTouch extracts bullet items only from the right section', () => {
+  const md = [
+    '# TRIDENT Project Context',
+    '## Do Not Touch',
+    '*Add paths or files TRIDENT should never modify.*',
+    '- `secrets/`',
+    '- dist/**',
+    '* .env',
+    '## Context for AI',
+    '- not-a-protected-path',
+  ].join('\n');
+  assert.deepEqual(parseDoNotTouch(md), ['secrets/', 'dist/**', '.env']);
+  assert.deepEqual(parseDoNotTouch(null), []);
+});
+
+test('isProtectedPath matches exact paths, directories, and globs', () => {
+  const patterns = ['secrets/', 'dist/**', '.env', '*.pem'];
+  assert.ok(isProtectedPath('secrets/key.txt', patterns));
+  assert.ok(isProtectedPath('dist/index.js', patterns));
+  assert.ok(isProtectedPath('.env', patterns));
+  assert.ok(isProtectedPath('server.pem', patterns));
+  assert.ok(!isProtectedPath('src/index.ts', patterns));
+  assert.ok(!isProtectedPath('environment.md', patterns));
+});
+
+test('executeTool blocks writes to Do Not Touch paths', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'trident-dnt-'));
+  try {
+    writeFileSync(join(root, '.env'), 'SECRET=1');
+    const result = await executeTool(
+      { name: 'write_file', input: { path: '.env', content: 'SECRET=hacked' } },
+      root,
+      async () => '',
+      ['.env']
+    );
+    assert.equal(result.success, false);
+    assert.match(result.error, /Do Not Touch/);
+
+    const allowed = await executeTool(
+      { name: 'write_file', input: { path: 'notes.txt', content: 'ok' } },
+      root,
+      async () => '',
+      ['.env']
+    );
+    assert.equal(allowed.success, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -59,14 +59,16 @@ function toOpenAIMessages(
     if (msg.role === 'user') {
       // Could be tool results array or plain string
       if (Array.isArray(msg.content)) {
-        // Tool results
-        for (const block of msg.content as Array<{ type: string; tool_use_id?: string; content?: string }>) {
+        // Tool results and/or user text blocks
+        for (const block of msg.content as Array<{ type: string; tool_use_id?: string; content?: string; text?: string }>) {
           if (block.type === 'tool_result') {
             result.push({
               role: 'tool',
               tool_call_id: block.tool_use_id,
               content: block.content || '',
             });
+          } else if (block.type === 'text') {
+            result.push({ role: 'user', content: block.text || '' });
           } else {
             result.push({ role: 'user', content: block.content || '' });
           }

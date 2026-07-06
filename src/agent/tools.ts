@@ -38,11 +38,27 @@ const TIMEOUT_MS = 30_000;
 export async function executeTool(
   call: ToolCall,
   cwd: string,
-  askUserFn: (q: string) => Promise<string>
+  askUserFn: (q: string) => Promise<string>,
+  protectedPaths: string[] = []
 ): Promise<ToolResult> {
   const start = Date.now();
 
   try {
+    if (
+      (call.name === 'write_file' || call.name === 'edit_file' || call.name === 'delete_file') &&
+      protectedPaths.length > 0
+    ) {
+      const rel = relative(resolve(cwd), resolveWorkspacePath(cwd, call.input.path as string));
+      if (isProtectedPath(rel, protectedPaths)) {
+        return {
+          success: false,
+          output: '',
+          error: `Blocked: "${rel}" is listed under "Do Not Touch" in TRIDENT.md and must not be modified.`,
+          duration_ms: Date.now() - start,
+        };
+      }
+    }
+
     switch (call.name) {
       case 'read_file': {
         const filePath = resolveWorkspacePath(cwd, call.input.path as string);
@@ -287,6 +303,51 @@ function deepestExistingAncestor(path: string): string {
     current = parent;
   }
   return current;
+}
+
+/**
+ * Match a workspace-relative path against TRIDENT.md "Do Not Touch" patterns.
+ * Supports exact paths, directory prefixes, and simple globs (*, **, ?).
+ */
+export function isProtectedPath(relPath: string, patterns: string[]): boolean {
+  const rel = relPath.replace(/\\/g, '/').replace(/^\.\//, '');
+  for (const raw of patterns) {
+    const pattern = raw.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+    if (!pattern) {
+      continue;
+    }
+    if (/[*?[\]{}]/.test(pattern)) {
+      if (globToRegExp(pattern).test(rel)) {
+        return true;
+      }
+    } else if (rel === pattern || rel.startsWith(`${pattern}/`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function globToRegExp(glob: string): RegExp {
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*') {
+      if (glob[i + 1] === '*') {
+        re += '.*';
+        i++;
+        if (glob[i + 1] === '/') i++;
+      } else {
+        re += '[^/]*';
+      }
+    } else if (c === '?') {
+      re += '[^/]';
+    } else if ('\\^$.|+()[]{}'.includes(c)) {
+      re += `\\${c}`;
+    } else {
+      re += c;
+    }
+  }
+  return new RegExp(`^${re}$`);
 }
 
 export function applyEdits(

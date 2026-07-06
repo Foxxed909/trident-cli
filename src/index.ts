@@ -16,8 +16,9 @@ import { formatEnvAssignment } from './util.js';
 import { ANTHROPIC_PRICING } from './providers/anthropic.js';
 import { SLASH_COMMAND_GROUPS } from './ui/commands.js';
 import { runOnboarding } from './ui/onboarding.js';
-import { loadOrCreateContext, generateTridentMd, buildSystemPrompt, generateProjectTree } from './oracle/index.js';
+import { loadOrCreateContext, generateTridentMd, buildSystemPrompt, generateProjectTree, parseDoNotTouch } from './oracle/index.js';
 import { runAgentLoop, type ProviderName as AgentProviderName } from './agent/loop.js';
+import type { ChatMessage } from './providers/anthropic.js';
 import { resolveWorkspacePath, TOOL_DEFINITIONS } from './agent/tools.js';
 import { listOpenRouterModels } from './providers/openrouter.js';
 import { codexSandboxForMode, isCodexCliAvailable, runCodexExec } from './providers/codex.js';
@@ -39,6 +40,15 @@ import {
   printSlashHelp,
   printStatus,
 } from './ui/renderer.js';
+
+// Silence deprecation noise from transitive dependencies (e.g. punycode)
+// while keeping other runtime warnings visible.
+process.removeAllListeners('warning');
+process.on('warning', (warning) => {
+  if (warning.name !== 'DeprecationWarning') {
+    console.warn(`${warning.name}: ${warning.message}`);
+  }
+});
 
 const program = new Command();
 
@@ -626,6 +636,7 @@ async function runTrident(
     profile: activeProfile,
     systemOverride,
   });
+  const getProtectedPaths = (): string[] => parseDoNotTouch(ctx.tridentMdContent);
 
   printSessionHeader({ model, mode, provider, project: ctx.name, hasTridentMd: !!ctx.tridentMdContent, profile: activeProfile?.name });
 
@@ -691,6 +702,7 @@ async function runTrident(
       codexTimeoutMs,
       cwd,
       askUserFn,
+      protectedPaths: getProtectedPaths(),
     });
     return;
   }
@@ -711,6 +723,8 @@ async function runTrident(
   };
   const undoStack: UndoEntry[] = [];
   const taskHistory: Array<{ task: string; summary: string; cost: number }> = [];
+  // Shared conversation memory: follow-up tasks see earlier turns.
+  const agentHistory: ChatMessage[] = [];
   let lastTask: string | null = null;
 
   const handleSlash = async (raw: string): Promise<boolean> => {
@@ -797,6 +811,8 @@ async function runTrident(
           cwd,
           askUserFn,
           undoStack,
+          history: agentHistory,
+          protectedPaths: getProtectedPaths(),
         });
         if (result) {
           session.cost += result.totalCost;
@@ -829,15 +845,27 @@ async function runTrident(
       }
 
       case 'compact': {
-        if (taskHistory.length === 0) {
+        if (taskHistory.length === 0 && agentHistory.length === 0) {
           printInfo('No history to compact.');
           return true;
         }
-        const kept = taskHistory.splice(-3);
+        const kept = taskHistory.slice(-3);
         taskHistory.length = 0;
         taskHistory.push(...kept);
+
+        // Replace the full conversation with a short recap so follow-up tasks
+        // keep the gist without the token weight.
+        agentHistory.length = 0;
+        if (kept.length > 0) {
+          const recap = kept
+            .map((t, i) => `${i + 1}. ${t.task} -> ${t.summary.slice(0, 200)}`)
+            .join('\n');
+          agentHistory.push({ role: 'user', content: `Recap of earlier tasks in this session:\n${recap}` });
+          agentHistory.push({ role: 'assistant', content: 'Recap noted. Ready for the next task.' });
+        }
+
         undoStack.length = 0;
-        printSuccess(`Compacted - kept last ${kept.length} task(s), undo stack cleared.`);
+        printSuccess(`Compacted - conversation memory reduced to a recap of the last ${kept.length} task(s); undo stack cleared.`);
         return true;
       }
 
@@ -1132,6 +1160,8 @@ async function runTrident(
       cwd,
       askUserFn,
       undoStack,
+      history: agentHistory,
+      protectedPaths: getProtectedPaths(),
     });
 
     if (result) {
@@ -1180,6 +1210,8 @@ async function executeTask(
     cwd: string;
     askUserFn: (q: string) => Promise<string>;
     undoStack?: UndoEntry[];
+    history?: ChatMessage[];
+    protectedPaths?: string[];
   }
 ): Promise<Awaited<ReturnType<typeof runAgentLoop>> | null> {
   printSectionHeader(`FORGE - ${opts.provider} - ${opts.model}`);
@@ -1261,6 +1293,8 @@ async function executeTask(
       beforeToolExecute,
       onToolEnd: printToolEnd,
       askUserFn: opts.askUserFn,
+      history: opts.history,
+      protectedPaths: opts.protectedPaths,
     });
 
     printFinalSummary(result);

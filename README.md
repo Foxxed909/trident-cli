@@ -109,7 +109,7 @@ Plain text without a leading `/` is sent to the agent as a task.
 - `/retry` - re-run the last task
 - `/undo` - revert the last approved file write or edit
 - `/save [file]` - save the current session transcript to a Markdown file
-- `/compact` - trim session history and clear the undo stack
+- `/compact` - replace conversation memory with a short recap of the last 3 tasks and clear the undo stack
 - `/budget` - show the current session budget
 - `/budget <usd>` - set the current session budget
 - `/budget clear` - clear the current session budget
@@ -263,9 +263,25 @@ trident/
 `-- README.md
 ```
 
+## Conversation memory
+
+In interactive mode, tasks share one conversation: follow-ups like "now add tests for that" see the earlier turns. Old tool outputs are trimmed automatically to bound token growth, and `/compact` collapses the whole conversation into a short recap when you want a fresh start without losing the thread. (One-shot `trident "task"` runs and the Codex provider are stateless.)
+
+## Do Not Touch enforcement
+
+Paths or globs listed as bullets under the `## Do Not Touch` section of `TRIDENT.md` are enforced, not just suggested: `write_file`, `edit_file`, and `delete_file` refuse to modify them even in yolo mode.
+
+```markdown
+## Do Not Touch
+- .env
+- secrets/
+- dist/**
+```
+
 ## Notes
 
 - Tool execution is restricted to the current workspace root, including symlink targets.
+- Loop detection blocks an identical tool call after 3 repeats and stops the run if the agent stays stuck, so a wedged agent cannot silently burn the budget.
 - `web_fetch` counts as an execute-level action (it can send data to arbitrary URLs), so review mode asks before fetching.
 - Unknown model ids are billed at a Sonnet-tier fallback rate for budget tracking, so budgets stay enforced.
 - Session budgets are enforced during agent runs.
