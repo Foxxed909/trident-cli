@@ -45,6 +45,8 @@ export const SLASH_COMMAND_GROUPS: SlashCommandGroup[] = [
       { cmd: '/context', desc: 'show current TRIDENT.md contents' },
       { cmd: '/tree', desc: 'show project file tree' },
       { cmd: '/cwd', desc: 'show working directory' },
+      { cmd: '/diff', desc: 'show uncommitted git changes' },
+      { cmd: '/commit', args: '[message]', desc: 'stage and commit; AI writes the message if omitted' },
     ],
   },
   {

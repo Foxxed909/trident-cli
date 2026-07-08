@@ -9,6 +9,7 @@ export const ConfigSchema = z.object({
   maxTurns: z.number().int().positive().default(50),
   budgetUsd: z.number().positive().optional(),
   logSessions: z.boolean().default(true),
+  allowedCommands: z.array(z.string()).default([]),
   onboarded: z.boolean().default(false),
   userName: z.string().default(''),
   profile: z.enum(TRAINED_PROFILE_NAMES).optional(),

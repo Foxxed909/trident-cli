@@ -72,6 +72,11 @@ trident "add input validation to the config loader"
 | `trident config <key> <value>` | Set a config value |
 | `trident doctor` | Check environment and API keys |
 | `trident review` | Review the latest session action log |
+| `trident review --risk <level>` | Filter the log by risk: read, write, execute, destructive |
+| `trident review --denied` | Show only denied actions |
+| `trident costs` | Aggregate spend per day across logged sessions |
+| `trident test-fix` | Run the project test command and let the agent fix failures until green |
+| `trident models <filter> --live` | Fetch the live OpenRouter catalog with current pricing |
 | `trident heal` | Diagnose common issues |
 | `trident heal --reset-config` | Reset config to defaults if invalid |
 | `trident heal --regen-md` | Regenerate `TRIDENT.md` in the current project |
@@ -89,10 +94,16 @@ trident "add input validation to the config loader"
 | `--system-override <text>` | Add an operator override that wins over profile output style |
 | `--codex-model <model>` | Optional Codex CLI model override when `--provider codex` |
 | `--codex-timeout <ms>` | Timeout for `codex exec` runs |
+| `-c, --continue` | Resume the previous conversation in this directory |
+| `--output json` | One-shot headless mode: machine-readable result on stdout (for scripts/CI) |
 
 ## Interactive commands
 
 Plain text without a leading `/` is sent to the agent as a task.
+
+- Prefix with `!` to run a shell command directly, no agent involved: `!npm test`
+- Mention files with `@path` to inline their contents into the task: `explain @src/config.ts`
+- Drop a Markdown file in `.trident/commands/<name>.md` to get a custom `/<name>` command; `$ARGS` in the file is replaced with anything typed after the command
 
 ### Session
 
@@ -107,7 +118,7 @@ Plain text without a leading `/` is sent to the agent as a task.
 ### Agent
 
 - `/retry` - re-run the last task
-- `/undo` - revert the last approved file write or edit
+- `/undo` - revert every file the last task changed (task-level checkpoint)
 - `/save [file]` - save the current session transcript to a Markdown file
 - `/compact` - replace conversation memory with a short recap of the last 3 tasks and clear the undo stack
 - `/budget` - show the current session budget
@@ -123,6 +134,8 @@ Plain text without a leading `/` is sent to the agent as a task.
 - `/context` - print the current `TRIDENT.md`
 - `/tree` - show the project file tree
 - `/cwd` - show the working directory
+- `/diff` - show uncommitted git changes
+- `/commit [message]` - stage everything and commit; the AI writes the message if omitted
 
 ### Config
 
@@ -143,6 +156,33 @@ Plain text without a leading `/` is sent to the agent as a task.
 | `review` | Auto-approve reads; confirm writes, commands, web fetches, and destructive actions |
 | `yolo` | Auto-approve everything |
 | `lockdown` | Confirm every action |
+
+### Persistent command allowlist
+
+When review mode asks about a shell command, choose **"Yes, and always allow"** to save a rule (the command's first two words, e.g. `npm test`). Matching commands are auto-approved in review mode from then on. Rules live in config:
+
+```bash
+trident config allowedCommands '["npm test","git status"]'
+```
+
+Destructive commands are never auto-approved by the allowlist, and without a terminal (piped input, CI) approval prompts are denied rather than assumed - use `--mode yolo` explicitly for unattended runs.
+
+## Session resume
+
+Conversations persist per directory. Pick up where you left off:
+
+```bash
+trident --continue                      # resume interactively
+trident --continue "now add the tests"  # resume with a one-shot follow-up
+```
+
+## Headless / CI usage
+
+```bash
+trident --mode yolo --output json "bump the version and update the changelog"
+```
+
+Prints a single JSON object (`success`, `summary`, `turns`, `totalCost`, `totalTokens`) on stdout with all decorative output suppressed.
 
 ## Configuration
 

@@ -5,6 +5,7 @@ import { existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import type { ToolCall } from '../agent/tools.js';
+import { getRawConfig, setConfig } from '../config.js';
 
 export type ApprovalMode = 'yolo' | 'review' | 'lockdown';
 export type RiskLevel = 'read' | 'write' | 'execute' | 'destructive';
@@ -86,6 +87,28 @@ export function getRiskEmoji(level: RiskLevel): string {
   }
 }
 
+/**
+ * Match a shell command against the persistent allowlist. A rule matches when
+ * the command equals it or starts with it followed by a space.
+ */
+export function commandMatchesAllowlist(cmd: string, allowlist: string[]): boolean {
+  const normalized = cmd.trim();
+  return allowlist.some((rule) => {
+    const r = rule.trim();
+    return r.length > 0 && (normalized === r || normalized.startsWith(`${r} `));
+  });
+}
+
+function getAllowedCommands(): string[] {
+  const raw = getRawConfig().allowedCommands;
+  return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string') : [];
+}
+
+/** Derive a persistable allowlist rule: the first two tokens (e.g. "npm test"). */
+function allowlistRuleFor(cmd: string): string {
+  return cmd.trim().split(/\s+/).slice(0, 2).join(' ');
+}
+
 export async function requestApproval(
   call: ToolCall,
   mode: ApprovalMode,
@@ -103,6 +126,13 @@ export async function requestApproval(
     if (risk === 'read') {
       return true;
     }
+    if (
+      call.name === 'run_command' &&
+      risk !== 'destructive' &&
+      commandMatchesAllowlist((call.input.cmd as string) || '', getAllowedCommands())
+    ) {
+      return true;
+    }
     return promptUser(call, risk);
   }
 
@@ -111,7 +141,9 @@ export async function requestApproval(
 
 async function promptUser(call: ToolCall, risk: RiskLevel): Promise<boolean> {
   if (!process.stdin.isTTY) {
-    return risk !== 'destructive';
+    // Without a terminal nobody can approve, so deny rather than assume
+    // consent. Piped/CI usage should opt in explicitly with --mode yolo.
+    return false;
   }
 
   console.log('');
@@ -123,6 +155,32 @@ async function promptUser(call: ToolCall, risk: RiskLevel): Promise<boolean> {
     console.log(chalk.dim(preview));
   }
   console.log(chalk.dim('-'.repeat(60)));
+
+  if (call.name === 'run_command' && risk !== 'destructive') {
+    const rule = allowlistRuleFor((call.input.cmd as string) || '');
+    const { choice } = await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'choice',
+        message: chalk.cyan('Allow this command?'),
+        choices: [
+          { name: 'Yes, once', value: 'yes' },
+          { name: `Yes, and always allow "${rule} ..."`, value: 'always' },
+          { name: 'No', value: 'no' },
+        ],
+        default: 'yes',
+      },
+    ]);
+
+    if (choice === 'always') {
+      const allowed = getAllowedCommands();
+      if (!allowed.includes(rule)) {
+        setConfig('allowedCommands', [...allowed, rule]);
+      }
+      console.log(chalk.dim(`  Saved: "${rule}" is now auto-approved in review mode.`));
+    }
+    return choice !== 'no';
+  }
 
   const { approved } = await inquirer.prompt([
     {

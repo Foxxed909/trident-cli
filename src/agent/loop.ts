@@ -27,6 +27,8 @@ export interface AgentOptions {
   history?: ChatMessage[];
   /** Paths/globs from TRIDENT.md "Do Not Touch" that writes must never modify. */
   protectedPaths?: string[];
+  /** Print diff previews before write/edit approvals (default true; off in headless mode). */
+  showDiffs?: boolean;
   onText?: (text: string) => void;
   onToolStart?: (call: ToolCall) => void | Promise<void>;
   beforeToolExecute?: (call: ToolCall) => void | Promise<void>;
@@ -206,7 +208,7 @@ export async function runAgentLoop(
       }
 
       let printedBetween = false;
-      if (call.name === 'write_file' || call.name === 'edit_file') {
+      if ((call.name === 'write_file' || call.name === 'edit_file') && opts.showDiffs !== false) {
         printedBetween = await showDiffPreview(call, opts.cwd);
       }
 
@@ -280,6 +282,25 @@ export async function runAgentLoop(
   if (!finalAnswerFound && !budgetExceeded && turns >= opts.maxTurns) {
     finalSummary = `Stopped after ${turns} turns (max turn limit reached). The task may be incomplete - resume by re-running with a continuation prompt.`;
   }
+
+  // Per-task rollup entry consumed by `trident costs`.
+  await logger.log({
+    toolName: '__task_summary',
+    input: { task: initialTask.slice(0, 200) },
+    result: {
+      success: finalAnswerFound && !budgetExceeded,
+      output: JSON.stringify({
+        cost: totalCost,
+        turns,
+        inputTokens: totalInputTokens,
+        outputTokens: totalOutputTokens,
+        model: opts.model,
+        provider: opts.provider,
+      }),
+    },
+    approved: true,
+    riskLevel: 'read',
+  });
 
   return {
     success: finalAnswerFound,

@@ -274,6 +274,9 @@ export function printSlashHelp(): void {
 
   console.log('');
   console.log('  ' + chalk.hex(SLATE).dim('Plain text without a leading "/" is sent as a task to the agent.'));
+  console.log('  ' + chalk.hex(SLATE).dim('Prefix with "!" to run a shell command directly (e.g. !npm test).'));
+  console.log('  ' + chalk.hex(SLATE).dim('Mention files with @path to inline their contents into the task.'));
+  console.log('  ' + chalk.hex(SLATE).dim('Custom commands: .trident/commands/<name>.md becomes /<name>.'));
   console.log('');
 }
 

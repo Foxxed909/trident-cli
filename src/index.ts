@@ -12,9 +12,11 @@ import { readFile as fsReadFile, writeFile as fsWriteFile, unlink as fsUnlink } 
 
 import { getConfig, getRawConfig, getDefaultConfig, resetConfigToDefaults, setConfig, deleteConfig, getConfigPath, ConfigSchema } from './config.js';
 import type { TridentConfig } from './config.js';
-import { formatEnvAssignment } from './util.js';
-import { ANTHROPIC_PRICING } from './providers/anthropic.js';
+import { formatEnvAssignment, expandFileMentions } from './util.js';
+import { ANTHROPIC_PRICING, streamCompletion } from './providers/anthropic.js';
+import { streamOpenRouter, fetchLiveOpenRouterModels } from './providers/openrouter.js';
 import { SLASH_COMMAND_GROUPS } from './ui/commands.js';
+import { saveSessionState, loadSessionState } from './session-store.js';
 import { runOnboarding } from './ui/onboarding.js';
 import { loadOrCreateContext, generateTridentMd, buildSystemPrompt, generateProjectTree, parseDoNotTouch } from './oracle/index.js';
 import { runAgentLoop, type ProviderName as AgentProviderName } from './agent/loop.js';
@@ -72,6 +74,8 @@ program
   .option('--system-override <text>', 'Operator system override appended to the agent prompt')
   .option('--codex-model <model>', 'Codex CLI model override (provider=codex only)')
   .option('--codex-timeout <ms>', 'Codex CLI timeout in milliseconds')
+  .option('-c, --continue', 'Resume the previous conversation in this directory')
+  .option('--output <format>', 'One-shot output format: text | json')
   .action(async (task?: string, opts?: {
     model?: string;
     provider?: string;
@@ -82,6 +86,8 @@ program
     systemOverride?: string;
     codexModel?: string;
     codexTimeout?: string;
+    continue?: boolean;
+    output?: string;
   }) => {
     await runTrident(task, opts);
   });
@@ -101,8 +107,154 @@ program
 program
   .command('models')
   .description('List available models for each provider')
-  .action(() => {
-    printAvailableModels();
+  .argument('[filter]', 'Filter live results by substring (with --live)')
+  .option('--live', 'Fetch the current OpenRouter catalog with live pricing')
+  .action(async (filter?: string, opts?: { live?: boolean }) => {
+    if (!opts?.live) {
+      printAvailableModels();
+      return;
+    }
+
+    printInfo('Fetching live model catalog from OpenRouter...');
+    try {
+      const models = await fetchLiveOpenRouterModels(filter);
+      const shown = models.slice(0, 40);
+      console.log(chalk.hex('#00D4FF').bold(`\nOpenRouter live catalog${filter ? ` (filter: "${filter}")` : ''}\n`));
+      for (const m of shown) {
+        const price = m.promptPerM === 0 && m.completionPerM === 0
+          ? chalk.green('free')
+          : chalk.dim(`$${m.promptPerM.toFixed(2)} / $${m.completionPerM.toFixed(2)} per M tokens`);
+        console.log(`  ${chalk.white(m.id.padEnd(52))} ${price}`);
+      }
+      if (models.length > shown.length) {
+        console.log(chalk.dim(`\n  ...and ${models.length - shown.length} more. Narrow with: trident models <filter> --live`));
+      }
+      console.log('');
+    } catch (err) {
+      printError(`Could not fetch live catalog: ${err instanceof Error ? err.message : String(err)}`);
+      printInfo('Falling back to the built-in list:');
+      printAvailableModels();
+    }
+  });
+
+program
+  .command('costs')
+  .description('Aggregate spend across logged sessions')
+  .action(async () => {
+    const summaries = await collectTaskSummaries();
+    if (summaries.length === 0) {
+      printInfo('No cost data found. Task costs are recorded when logSessions is on.');
+      return;
+    }
+
+    const byDay = new Map<string, { tasks: number; cost: number; tokens: number }>();
+    for (const s of summaries) {
+      const day = s.timestamp.slice(0, 10);
+      const agg = byDay.get(day) || { tasks: 0, cost: 0, tokens: 0 };
+      agg.tasks++;
+      agg.cost += s.cost;
+      agg.tokens += s.inputTokens + s.outputTokens;
+      byDay.set(day, agg);
+    }
+
+    console.log(chalk.hex('#00D4FF').bold('\nTRIDENT Cost Report\n'));
+    console.log('  ' + chalk.gray('date'.padEnd(12)) + chalk.gray('tasks'.padEnd(8)) + chalk.gray('tokens'.padEnd(12)) + chalk.gray('cost'));
+    let totalCost = 0;
+    let totalTasks = 0;
+    for (const [day, agg] of [...byDay.entries()].sort()) {
+      console.log('  ' + chalk.white(day.padEnd(12)) + chalk.white(String(agg.tasks).padEnd(8)) + chalk.white(agg.tokens.toLocaleString().padEnd(12)) + chalk.hex('#F5C97A')('$' + agg.cost.toFixed(4)));
+      totalCost += agg.cost;
+      totalTasks += agg.tasks;
+    }
+    console.log('');
+    console.log('  ' + chalk.bold(`total: ${totalTasks} task(s), $${totalCost.toFixed(4)}`));
+    console.log('');
+  });
+
+program
+  .command('test-fix')
+  .description('Run the project test command and let the agent fix failures until green')
+  .option('--max-attempts <n>', 'Maximum fix attempts', '3')
+  .action(async (opts: { maxAttempts?: string }) => {
+    const maxAttempts = resolvePositiveInteger(opts.maxAttempts, 3, 'max attempts');
+    let config: TridentConfig;
+    try {
+      config = getConfig();
+    } catch (err) {
+      printError(err instanceof Error ? err.message : String(err));
+      printInfo('Run "trident heal --reset-config" to recover the config.');
+      process.exit(1);
+      return;
+    }
+
+    const cwd = process.cwd();
+    printLogo();
+    printInfo('Loading project context...');
+    const ctx = await loadOrCreateContext(cwd);
+    const testCmd = ctx.commands.test;
+    if (!testCmd) {
+      printError('No test command detected for this project (no test script/config found).');
+      process.exit(1);
+      return;
+    }
+
+    const provider = resolveProvider(undefined, config.provider, config.model);
+    const model = provider === 'codex' ? (config.codexModel || 'codex default') : config.model;
+    const systemPrompt = buildSystemPrompt(ctx, { systemOverride: config.systemOverride });
+    const history: ChatMessage[] = [];
+    const isWindows = process.platform === 'win32';
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      printSectionHeader(`test-fix - attempt ${attempt}/${maxAttempts} - ${testCmd}`);
+      const run = await execa(isWindows ? 'cmd' : 'bash', [isWindows ? '/c' : '-c', testCmd], {
+        cwd,
+        all: true,
+        reject: false,
+        timeout: 300_000,
+      });
+      const output = typeof run.all === 'string' ? run.all : String(run.all ?? '');
+
+      if ((run.exitCode ?? 1) === 0 && !run.timedOut) {
+        printSuccess(`Tests pass (attempt ${attempt}).`);
+        return;
+      }
+
+      printWarn(`Tests failed (exit ${run.timedOut ? 'timeout' : run.exitCode}).`);
+      if (attempt === maxAttempts) {
+        printError(`Still failing after ${maxAttempts} attempt(s). Last output tail:`);
+        console.log(chalk.dim(output.slice(-2000)));
+        process.exit(1);
+        return;
+      }
+
+      const task = [
+        `The project test command "${testCmd}" is failing. Investigate the failures, fix the code (or the tests if they are wrong), and re-run the tests to verify.`,
+        '',
+        'Test output (tail):',
+        output.slice(-6000),
+      ].join('\n');
+
+      await executeTask(task, {
+        model,
+        mode: config.mode,
+        provider,
+        maxTurns: config.maxTurns,
+        budgetUsd: config.budgetUsd,
+        logSessions: config.logSessions,
+        systemPrompt,
+        profile: null,
+        codexTimeoutMs: config.codexTimeoutMs,
+        cwd,
+        askUserFn: async (question: string): Promise<string> => {
+          const { answer } = await inquirer.prompt([
+            { type: 'input', name: 'answer', message: chalk.hex('#00D4FF')(question) },
+          ]);
+          return answer;
+        },
+        history,
+        protectedPaths: parseDoNotTouch(ctx.tridentMdContent),
+      });
+    }
   });
 
 program
@@ -417,7 +569,15 @@ program
 program
   .command('review')
   .description('Review the last session action log')
-  .action(async () => {
+  .option('--risk <level>', 'Only show actions at this risk level: read | write | execute | destructive')
+  .option('--denied', 'Only show actions that were denied')
+  .action(async (opts: { risk?: string; denied?: boolean }) => {
+    if (opts.risk && !['read', 'write', 'execute', 'destructive'].includes(opts.risk.toLowerCase())) {
+      printError('Invalid --risk. Use: read | write | execute | destructive');
+      process.exit(1);
+      return;
+    }
+
     const files = await getRecentSessionLogFiles();
     if (files.length === 0) {
       printError('No session logs found.');
@@ -430,11 +590,25 @@ program
       return;
     }
 
+    let entries = loaded.entries.filter((e) => !e.toolName.startsWith('__'));
+    if (opts.risk) {
+      const level = opts.risk.toLowerCase();
+      entries = entries.filter((e) => e.riskLevel === level);
+    }
+    if (opts.denied) {
+      entries = entries.filter((e) => !e.approved);
+    }
+
     console.log(chalk.cyan(`\nSession: ${loaded.file.replace('.jsonl', '')}\n`));
-    for (const entry of loaded.entries) {
+    if (entries.length === 0) {
+      printInfo('No matching actions in this session.');
+      return;
+    }
+    for (const entry of entries) {
       const icon = entry.approved ? chalk.green('OK') : chalk.red('NO');
       const time = new Date(entry.timestamp).toLocaleTimeString();
-      console.log(`  ${icon} [${chalk.dim(time)}] ${chalk.bold(entry.toolName)} ${chalk.dim(JSON.stringify(entry.input).slice(0, 60))}`);
+      const risk = entry.riskLevel ? chalk.dim(`[${entry.riskLevel}]`) : '';
+      console.log(`  ${icon} [${chalk.dim(time)}] ${chalk.bold(entry.toolName)} ${risk} ${chalk.dim(JSON.stringify(entry.input).slice(0, 60))}`);
     }
     console.log('');
   });
@@ -538,6 +712,7 @@ function resolveProvider(cliProvider?: string, configProvider?: string, model?: 
 }
 
 interface UndoEntry {
+  taskId: string;
   path: string;
   originalContent: string | null;
 }
@@ -597,6 +772,8 @@ async function runTrident(
     systemOverride?: string;
     codexModel?: string;
     codexTimeout?: string;
+    continue?: boolean;
+    output?: string;
   }
 ): Promise<void> {
   let config: TridentConfig;
@@ -610,7 +787,14 @@ async function runTrident(
     return;
   }
 
-  if (!config.onboarded) {
+  if (cliOpts?.output && !['text', 'json'].includes(cliOpts.output)) {
+    printError(`Invalid --output "${cliOpts.output}". Use: text | json`);
+    process.exit(1);
+    return;
+  }
+  const jsonOut = cliOpts?.output === 'json' && !!initialTask;
+
+  if (!config.onboarded && !jsonOut) {
     await runOnboarding();
     Object.assign(config, getConfig());
   }
@@ -628,20 +812,27 @@ async function runTrident(
   const codexTimeoutMs = resolvePositiveInteger(cliOpts?.codexTimeout, config.codexTimeoutMs, 'codex timeout');
   const cwd = process.cwd();
 
-  printLogo();
-
-  printInfo('Loading project context...');
+  if (!jsonOut) {
+    printLogo();
+    printInfo('Loading project context...');
+  }
   const ctx = await loadOrCreateContext(cwd);
+  const resumedState = cliOpts?.continue ? await loadSessionState(cwd) : null;
+  if (cliOpts?.continue && !resumedState && !jsonOut) {
+    printWarn('No previous conversation found for this directory - starting fresh.');
+  }
   const getSystemPrompt = (): string => buildSystemPrompt(ctx, {
     profile: activeProfile,
     systemOverride,
   });
   const getProtectedPaths = (): string[] => parseDoNotTouch(ctx.tridentMdContent);
 
-  printSessionHeader({ model, mode, provider, project: ctx.name, hasTridentMd: !!ctx.tridentMdContent, profile: activeProfile?.name });
+  if (!jsonOut) {
+    printSessionHeader({ model, mode, provider, project: ctx.name, hasTridentMd: !!ctx.tridentMdContent, profile: activeProfile?.name });
 
-  if (!ctx.tridentMdContent) {
-    printInfo("No TRIDENT.md found. Run 'trident init' to generate one for better AI context.");
+    if (!ctx.tridentMdContent) {
+      printInfo("No TRIDENT.md found. Run 'trident init' to generate one for better AI context.");
+    }
   }
 
   const askUserFn = async (question: string): Promise<string> => {
@@ -690,7 +881,8 @@ async function runTrident(
   await ensureProviderReady(provider);
 
   if (initialTask) {
-    await executeTask(initialTask, {
+    const oneShotHistory: ChatMessage[] = resumedState ? [...resumedState.history] : [];
+    const result = await executeTask(initialTask, {
       model,
       mode,
       provider,
@@ -703,7 +895,29 @@ async function runTrident(
       cwd,
       askUserFn,
       protectedPaths: getProtectedPaths(),
+      history: oneShotHistory,
+      quiet: jsonOut,
     });
+
+    if (provider !== 'codex') {
+      await saveSessionState({
+        cwd,
+        savedAt: new Date().toISOString(),
+        history: oneShotHistory,
+        taskHistory: [
+          ...(resumedState?.taskHistory || []),
+          { task: initialTask, summary: result?.summary || '(failed)', cost: result?.totalCost || 0 },
+        ],
+        lastTask: initialTask,
+      });
+    }
+
+    if (jsonOut) {
+      console.log(JSON.stringify(result ?? { success: false, summary: 'Task failed before completion.', turns: 0, totalCost: 0, totalTokens: { input: 0, output: 0 } }));
+    }
+    if (result === null) {
+      process.exitCode = 1;
+    }
     return;
   }
 
@@ -726,6 +940,64 @@ async function runTrident(
   // Shared conversation memory: follow-up tasks see earlier turns.
   const agentHistory: ChatMessage[] = [];
   let lastTask: string | null = null;
+
+  if (resumedState) {
+    agentHistory.push(...resumedState.history);
+    taskHistory.push(...resumedState.taskHistory);
+    lastTask = resumedState.lastTask;
+    printInfo(`Resumed conversation from ${new Date(resumedState.savedAt).toLocaleString()} (${resumedState.taskHistory.length} earlier task(s)).`);
+  }
+
+  const persistSession = async (): Promise<void> => {
+    await saveSessionState({
+      cwd,
+      savedAt: new Date().toISOString(),
+      history: agentHistory,
+      taskHistory,
+      lastTask,
+    });
+  };
+
+  const runInteractiveTask = async (task: string): Promise<void> => {
+    lastTask = task;
+
+    if (session.budgetUsd !== undefined && session.cost >= session.budgetUsd) {
+      printWarn(`Session budget reached ($${session.budgetUsd.toFixed(2)}). Raise it with /budget <usd> to continue.`);
+      return;
+    }
+
+    if (!(await ensureProviderReady(session.provider, true))) {
+      return;
+    }
+
+    const result = await executeTask(task, {
+      model: session.model,
+      mode: session.mode,
+      provider: session.provider,
+      maxTurns,
+      budgetUsd: remainingBudget(session),
+      logSessions: config.logSessions,
+      systemPrompt: getSystemPrompt(),
+      profile: activeProfile,
+      codexTimeoutMs,
+      cwd,
+      askUserFn,
+      undoStack,
+      history: agentHistory,
+      protectedPaths: getProtectedPaths(),
+    });
+
+    if (result) {
+      session.cost += result.totalCost;
+      session.tokens.input += result.totalTokens.input;
+      session.tokens.output += result.totalTokens.output;
+      session.turns += result.turns;
+      taskHistory.push({ task, summary: result.summary, cost: result.totalCost });
+      if (session.provider !== 'codex') {
+        await persistSession();
+      }
+    }
+  };
 
   const handleSlash = async (raw: string): Promise<boolean> => {
     const cmd = raw.slice(1).trim();
@@ -791,36 +1063,7 @@ async function runTrident(
           return true;
         }
         printInfo(`Retrying: ${lastTask}`);
-        if (session.budgetUsd !== undefined && session.cost >= session.budgetUsd) {
-          printWarn(`Session budget reached ($${session.budgetUsd.toFixed(2)}). Start a new session with a higher --budget to continue.`);
-          return true;
-        }
-        if (!(await ensureProviderReady(session.provider, true))) {
-          return true;
-        }
-        const result = await executeTask(lastTask, {
-          model: session.model,
-          mode: session.mode,
-          provider: session.provider,
-          maxTurns,
-          budgetUsd: remainingBudget(session),
-          logSessions: config.logSessions,
-          systemPrompt: getSystemPrompt(),
-          profile: activeProfile,
-          codexTimeoutMs,
-          cwd,
-          askUserFn,
-          undoStack,
-          history: agentHistory,
-          protectedPaths: getProtectedPaths(),
-        });
-        if (result) {
-          session.cost += result.totalCost;
-          session.tokens.input += result.totalTokens.input;
-          session.tokens.output += result.totalTokens.output;
-          session.turns += result.turns;
-          taskHistory.push({ task: lastTask, summary: result.summary, cost: result.totalCost });
-        }
+        await runInteractiveTask(lastTask);
         return true;
       }
 
@@ -829,17 +1072,29 @@ async function runTrident(
           printWarn('Nothing to undo.');
           return true;
         }
-        const entry = undoStack.pop()!;
-        try {
-          if (entry.originalContent === null) {
-            await fsUnlink(entry.path);
-            printSuccess(`Undo: deleted ${entry.path}`);
-          } else {
-            await fsWriteFile(entry.path, entry.originalContent, 'utf-8');
-            printSuccess(`Undo: restored ${entry.path}`);
+        // Revert every file the last task touched, newest snapshot first.
+        const taskId = undoStack[undoStack.length - 1].taskId;
+        const entries: UndoEntry[] = [];
+        while (undoStack.length > 0 && undoStack[undoStack.length - 1].taskId === taskId) {
+          entries.push(undoStack.pop()!);
+        }
+        let reverted = 0;
+        for (const entry of entries) {
+          try {
+            if (entry.originalContent === null) {
+              await fsUnlink(entry.path);
+              printSuccess(`Undo: deleted ${entry.path}`);
+            } else {
+              await fsWriteFile(entry.path, entry.originalContent, 'utf-8');
+              printSuccess(`Undo: restored ${entry.path}`);
+            }
+            reverted++;
+          } catch (err) {
+            printError(`Undo failed for ${entry.path}: ${err instanceof Error ? err.message : String(err)}`);
           }
-        } catch (err) {
-          printError(`Undo failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        if (reverted > 1) {
+          printInfo(`Reverted ${reverted} file(s) changed by the last task.`);
         }
         return true;
       }
@@ -865,6 +1120,7 @@ async function runTrident(
         }
 
         undoStack.length = 0;
+        await persistSession();
         printSuccess(`Compacted - conversation memory reduced to a recap of the last ${kept.length} task(s); undo stack cleared.`);
         return true;
       }
@@ -1025,6 +1281,84 @@ async function runTrident(
         printInfo(`Working directory: ${chalk.white(cwd)}`);
         return true;
 
+      case 'diff': {
+        if (!(await isGitRepo(cwd))) {
+          printWarn('Not a git repository.');
+          return true;
+        }
+        const status = await execa('git', ['status', '--short'], { cwd, reject: false });
+        const diff = await execa('git', ['diff', '--color=always'], { cwd, reject: false });
+        if (!status.stdout.trim() && !diff.stdout.trim()) {
+          printInfo('Working tree clean - nothing to show.');
+          return true;
+        }
+        console.log('');
+        console.log('  ' + chalk.hex('#5EEAD4').bold('Working tree changes'));
+        console.log('');
+        if (status.stdout.trim()) {
+          for (const line of status.stdout.split('\n')) {
+            console.log('  ' + line);
+          }
+          console.log('');
+        }
+        const diffLines = diff.stdout ? diff.stdout.split('\n') : [];
+        const shown = diffLines.slice(0, 300);
+        for (const line of shown) {
+          console.log('  ' + line);
+        }
+        if (diffLines.length > shown.length) {
+          console.log(chalk.dim(`  ...${diffLines.length - shown.length} more line(s). Run git diff for the full view.`));
+        }
+        console.log('');
+        return true;
+      }
+
+      case 'commit': {
+        if (!(await isGitRepo(cwd))) {
+          printWarn('Not a git repository.');
+          return true;
+        }
+        const status = await execa('git', ['status', '--porcelain'], { cwd, reject: false });
+        if (!status.stdout.trim()) {
+          printInfo('Nothing to commit - working tree clean.');
+          return true;
+        }
+
+        let message = arg;
+        if (!message) {
+          if (session.provider === 'codex') {
+            printError('AI commit messages need the anthropic or openrouter provider. Use: /commit <message>');
+            return true;
+          }
+          if (!(await ensureProviderReady(session.provider, true))) {
+            return true;
+          }
+          printInfo('Generating commit message...');
+          const diffOut = await execa('git', ['diff', 'HEAD'], { cwd, reject: false });
+          const context = `Changed files:\n${status.stdout}\n\nDiff:\n${(diffOut.stdout || '').slice(0, 8000)}`;
+          try {
+            message = await generateCommitMessage(session.provider as AgentProviderName, session.model, context);
+          } catch (err) {
+            printError(`Could not generate a message (${err instanceof Error ? err.message : String(err)}). Use: /commit <message>`);
+            return true;
+          }
+          if (!message) {
+            printError('Could not generate a message. Use: /commit <message>');
+            return true;
+          }
+          printInfo(`Message: ${chalk.white(message)}`);
+        }
+
+        await execa('git', ['add', '-A'], { cwd, reject: false });
+        const commit = await execa('git', ['commit', '-m', message], { cwd, reject: false, all: true });
+        if ((commit.exitCode ?? 1) === 0) {
+          printSuccess(commit.stdout.split('\n')[0] || 'Committed.');
+        } else {
+          printError(`Commit failed: ${String(commit.all || '').slice(0, 200)}`);
+        }
+        return true;
+      }
+
       case 'mode':
         if (!arg || !/^(yolo|review|lockdown)$/i.test(arg)) {
           printError('Usage: /mode yolo | review | lockdown');
@@ -1104,9 +1438,30 @@ async function runTrident(
         return true;
       }
 
-      default:
+      default: {
+        // Project-defined commands: .trident/commands/<name>.md
+        const customPath = join(cwd, '.trident', 'commands', `${head.toLowerCase()}.md`);
+        if (existsSync(customPath)) {
+          let template: string;
+          try {
+            template = await fsReadFile(customPath, 'utf-8');
+          } catch (err) {
+            printError(`Could not read ${customPath}: ${err instanceof Error ? err.message : String(err)}`);
+            return true;
+          }
+          const task = template.includes('$ARGS')
+            ? template.replaceAll('$ARGS', arg)
+            : arg
+              ? `${template}\n\nAdditional arguments: ${arg}`
+              : template;
+          printInfo(`Running custom command /${head.toLowerCase()}`);
+          await runInteractiveTask(task.trim());
+          return true;
+        }
+
         printWarn(`Unknown command: /${head}. Type / then Enter for the menu, or /help for the list.`);
         return true;
+      }
     }
   };
 
@@ -1126,6 +1481,29 @@ async function runTrident(
       return;
     }
 
+    // Shell passthrough: !cmd runs directly without the agent.
+    if (task.startsWith('!')) {
+      const cmd = task.slice(1).trim();
+      if (!cmd) {
+        printWarn('Usage: !<shell command>');
+        return;
+      }
+      const isWindows = process.platform === 'win32';
+      try {
+        const res = await execa(isWindows ? 'cmd' : 'bash', [isWindows ? '/c' : '-c', cmd], {
+          cwd,
+          stdio: 'inherit',
+          reject: false,
+        });
+        if ((res.exitCode ?? 0) !== 0) {
+          printWarn(`Exit code: ${res.exitCode}`);
+        }
+      } catch (err) {
+        printError(err instanceof Error ? err.message : String(err));
+      }
+      return;
+    }
+
     if (/^(exit|quit)$/i.test(task)) {
       await handleSlash('/exit');
       return;
@@ -1136,41 +1514,7 @@ async function runTrident(
       return;
     }
 
-    lastTask = task;
-
-    if (session.budgetUsd !== undefined && session.cost >= session.budgetUsd) {
-      printWarn(`Session budget reached ($${session.budgetUsd.toFixed(2)}). Start a new session with a higher --budget to continue.`);
-      return;
-    }
-
-    if (!(await ensureProviderReady(session.provider, true))) {
-      return;
-    }
-
-    const result = await executeTask(task, {
-      model: session.model,
-      mode: session.mode,
-      provider: session.provider,
-      maxTurns,
-      budgetUsd: remainingBudget(session),
-      logSessions: config.logSessions,
-      systemPrompt: getSystemPrompt(),
-      profile: activeProfile,
-      codexTimeoutMs,
-      cwd,
-      askUserFn,
-      undoStack,
-      history: agentHistory,
-      protectedPaths: getProtectedPaths(),
-    });
-
-    if (result) {
-      session.cost += result.totalCost;
-      session.tokens.input += result.totalTokens.input;
-      session.tokens.output += result.totalTokens.output;
-      session.turns += result.turns;
-      taskHistory.push({ task, summary: result.summary, cost: result.totalCost });
-    }
+    await runInteractiveTask(task);
   };
 
   if (process.stdin.isTTY) {
@@ -1212,14 +1556,21 @@ async function executeTask(
     undoStack?: UndoEntry[];
     history?: ChatMessage[];
     protectedPaths?: string[];
+    quiet?: boolean;
   }
 ): Promise<Awaited<ReturnType<typeof runAgentLoop>> | null> {
-  printSectionHeader(`FORGE - ${opts.provider} - ${opts.model}`);
-  console.log(chalk.dim(`  ${task}`));
-  console.log('');
+  task = expandFileMentions(task, opts.cwd);
+
+  if (!opts.quiet) {
+    printSectionHeader(`FORGE - ${opts.provider} - ${opts.model}`);
+    console.log(chalk.dim(`  ${task.split('\n')[0]}`));
+    console.log('');
+  }
 
   if (opts.provider === 'codex') {
-    printInfo(`Running Codex CLI${opts.profile ? ` with ${opts.profile.name}` : ''} (${opts.mode} -> ${codexSandboxForMode(opts.mode)} sandbox).`);
+    if (!opts.quiet) {
+      printInfo(`Running Codex CLI${opts.profile ? ` with ${opts.profile.name}` : ''} (${opts.mode} -> ${codexSandboxForMode(opts.mode)} sandbox).`);
+    }
     try {
       const codexResult = await runCodexExec({
         cwd: opts.cwd,
@@ -1237,9 +1588,11 @@ async function executeTask(
         totalCost: 0,
         totalTokens: { input: 0, output: 0 },
       };
-      printFinalSummary(result);
-      if (!codexResult.success) {
-        printWarn('Codex CLI did not complete successfully. Run "codex doctor" for details.');
+      if (!opts.quiet) {
+        printFinalSummary(result);
+        if (!codexResult.success) {
+          printWarn('Codex CLI did not complete successfully. Run "codex doctor" for details.');
+        }
       }
       return result;
     } catch (err) {
@@ -1268,13 +1621,17 @@ async function executeTask(
     } catch {
       return;
     }
+    // Only the first snapshot per task matters: /undo restores pre-task state.
+    if (opts.undoStack.some((e) => e.taskId === sessionId && e.path === filePath)) {
+      return;
+    }
     let originalContent: string | null = null;
     try {
       originalContent = await fsReadFile(filePath, 'utf-8');
     } catch {
       // File did not exist before this change.
     }
-    opts.undoStack.push({ path: filePath, originalContent });
+    opts.undoStack.push({ taskId: sessionId, path: filePath, originalContent });
   };
 
   try {
@@ -1288,16 +1645,19 @@ async function executeTask(
       budgetUsd: opts.budgetUsd,
       logSessions: opts.logSessions,
       sessionId,
-      onText: printAgentText,
-      onToolStart,
+      onText: opts.quiet ? undefined : printAgentText,
+      onToolStart: opts.quiet ? undefined : onToolStart,
       beforeToolExecute,
-      onToolEnd: printToolEnd,
+      onToolEnd: opts.quiet ? undefined : printToolEnd,
       askUserFn: opts.askUserFn,
       history: opts.history,
       protectedPaths: opts.protectedPaths,
+      showDiffs: !opts.quiet,
     });
 
-    printFinalSummary(result);
+    if (!opts.quiet) {
+      printFinalSummary(result);
+    }
     return result;
   } catch (err) {
     console.log('');
@@ -1374,6 +1734,37 @@ function resolveConfiguredProfile(cliProfile?: string, configProfile?: string): 
   return profile;
 }
 
+async function isGitRepo(cwd: string): Promise<boolean> {
+  const res = await execa('git', ['rev-parse', '--is-inside-work-tree'], { cwd, reject: false });
+  return (res.exitCode ?? 1) === 0;
+}
+
+async function generateCommitMessage(
+  provider: AgentProviderName,
+  model: string,
+  changes: string
+): Promise<string> {
+  const prompt = `Write a single-line conventional commit message (max 72 characters) for the following changes. Respond with ONLY the message - no quotes, no explanation.\n\n${changes}`;
+  const messages: ChatMessage[] = [{ role: 'user', content: prompt }];
+  const streamOpts = {
+    model,
+    maxTokens: 100,
+    systemPrompt: 'You write concise conventional commit messages.',
+    tools: [] as unknown[],
+  };
+  const stream = provider === 'openrouter'
+    ? streamOpenRouter(messages, { ...streamOpts, apiKey: process.env.OPENROUTER_API_KEY || '' })
+    : streamCompletion(messages, streamOpts);
+
+  let text = '';
+  for await (const chunk of stream) {
+    if (chunk.type === 'text' && chunk.text) {
+      text += chunk.text;
+    }
+  }
+  return text.trim().split('\n')[0].replace(/^["'`]+|["'`]+$/g, '').slice(0, 100);
+}
+
 function printAvailableModels(): void {
   console.log(chalk.hex('#00D4FF').bold('\nTRIDENT - Available Models\n'));
 
@@ -1412,6 +1803,50 @@ function printAvailableProfiles(): void {
   console.log(chalk.dim('    Use: trident --provider codex --profile Sydney "task"'));
 }
 
+interface TaskSummary {
+  timestamp: string;
+  cost: number;
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+async function collectTaskSummaries(): Promise<TaskSummary[]> {
+  const { homedir } = await import('os');
+  const { readFile } = await import('fs/promises');
+  const logDir = join(homedir(), '.trident', 'logs');
+  const files = await getRecentSessionLogFiles();
+  const summaries: TaskSummary[] = [];
+
+  for (const file of files) {
+    let content: string;
+    try {
+      content = await readFile(join(logDir, file), 'utf-8');
+    } catch {
+      continue;
+    }
+    for (const line of content.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line) as { timestamp?: string; toolName?: string; result?: { output?: string } };
+        if (entry.toolName !== '__task_summary' || !entry.result?.output) continue;
+        const stats = JSON.parse(entry.result.output) as { cost?: number; turns?: number; inputTokens?: number; outputTokens?: number };
+        summaries.push({
+          timestamp: entry.timestamp || '',
+          cost: Number(stats.cost) || 0,
+          turns: Number(stats.turns) || 0,
+          inputTokens: Number(stats.inputTokens) || 0,
+          outputTokens: Number(stats.outputTokens) || 0,
+        });
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  return summaries;
+}
+
 async function getRecentSessionLogFiles(limit?: number): Promise<string[]> {
   const { homedir } = await import('os');
   const { readdir, stat } = await import('fs/promises');
@@ -1438,6 +1873,7 @@ async function loadLatestReviewableSession(files: string[]): Promise<{
     timestamp: string;
     approved: boolean;
     toolName: string;
+    riskLevel?: string;
     input: Record<string, unknown>;
   }>;
 } | null> {
@@ -1458,6 +1894,7 @@ async function loadLatestReviewableSession(files: string[]): Promise<{
           timestamp: string;
           approved: boolean;
           toolName: string;
+          riskLevel?: string;
           input: Record<string, unknown>;
         }];
       } catch {

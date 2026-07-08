@@ -8,7 +8,8 @@ import { parseDoNotTouch } from '../dist/oracle/index.js';
 import { ConfigSchema } from '../dist/config.js';
 import { calculateCost } from '../dist/providers/anthropic.js';
 import { OPENROUTER_MODELS } from '../dist/providers/openrouter.js';
-import { classifyRisk } from '../dist/warden/index.js';
+import { classifyRisk, commandMatchesAllowlist } from '../dist/warden/index.js';
+import { expandFileMentions } from '../dist/util.js';
 import { TRAINED_PROFILE_NAMES, buildProfileSystemPrompt, resolveProfile } from '../dist/profiles.js';
 
 test('trained profiles are all registered and case-insensitive', () => {
@@ -111,6 +112,32 @@ test('isProtectedPath matches exact paths, directories, and globs', () => {
   assert.ok(isProtectedPath('server.pem', patterns));
   assert.ok(!isProtectedPath('src/index.ts', patterns));
   assert.ok(!isProtectedPath('environment.md', patterns));
+});
+
+test('command allowlist matches exact and prefixed commands only', () => {
+  const rules = ['npm test', 'git status'];
+  assert.ok(commandMatchesAllowlist('npm test', rules));
+  assert.ok(commandMatchesAllowlist('npm test -- --watch', rules));
+  assert.ok(commandMatchesAllowlist('git status --short', rules));
+  assert.ok(!commandMatchesAllowlist('npm testx', rules));
+  assert.ok(!commandMatchesAllowlist('npm install', rules));
+  assert.ok(!commandMatchesAllowlist('rm -rf /', rules));
+  assert.ok(!commandMatchesAllowlist('npm', rules));
+});
+
+test('expandFileMentions inlines existing files and skips unknown mentions', () => {
+  const root = mkdtempSync(join(tmpdir(), 'trident-mention-'));
+  try {
+    writeFileSync(join(root, 'notes.txt'), 'hello world');
+    const expanded = expandFileMentions('summarize @notes.txt please', root);
+    assert.match(expanded, /Content of @notes\.txt/);
+    assert.match(expanded, /hello world/);
+
+    const untouched = expandFileMentions('ping @nosuchfile.txt and @also/missing.ts', root);
+    assert.equal(untouched, 'ping @nosuchfile.txt and @also/missing.ts');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('executeTool blocks writes to Do Not Touch paths', async () => {

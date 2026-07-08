@@ -122,17 +122,18 @@ export async function* streamOpenRouter(
   opts: OpenRouterOptions
 ): AsyncGenerator<StreamChunk> {
   const openAIMessages = toOpenAIMessages(messages, opts.systemPrompt);
-  const openAITools = toOpenAITools(opts.tools);
 
-  const body = {
+  const body: Record<string, unknown> = {
     model: opts.model,
     max_tokens: opts.maxTokens,
     messages: openAIMessages,
-    tools: openAITools,
-    tool_choice: 'auto',
     stream_options: { include_usage: true },
     stream: true,
   };
+  if (opts.tools.length > 0) {
+    body.tools = toOpenAITools(opts.tools);
+    body.tool_choice = 'auto';
+  }
 
   const resp = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
     method: 'POST',
@@ -256,6 +257,40 @@ export function calculateOpenRouterCost(
 ): number {
   const pricing = OPENROUTER_MODELS[model as OpenRouterModel] || { input: 1, output: 3 };
   return (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
+}
+
+export interface LiveModel {
+  id: string;
+  promptPerM: number;
+  completionPerM: number;
+}
+
+/** Fetch the live model catalog from the OpenRouter public API (no key needed). */
+export async function fetchLiveOpenRouterModels(filter?: string): Promise<LiveModel[]> {
+  const resp = await fetch(`${OPENROUTER_BASE_URL}/models`, {
+    signal: AbortSignal.timeout(15_000),
+    headers: { 'User-Agent': 'TRIDENT-CLI/1.0' },
+  });
+  if (!resp.ok) {
+    throw new Error(`OpenRouter models API returned HTTP ${resp.status}`);
+  }
+
+  const payload = (await resp.json()) as { data?: Array<{ id?: string; pricing?: { prompt?: string; completion?: string } }> };
+  let models: LiveModel[] = (payload.data || [])
+    .filter((m) => typeof m.id === 'string')
+    .map((m) => ({
+      id: m.id as string,
+      promptPerM: Number(m.pricing?.prompt || 0) * 1_000_000,
+      completionPerM: Number(m.pricing?.completion || 0) * 1_000_000,
+    }));
+
+  if (filter) {
+    const needle = filter.toLowerCase();
+    models = models.filter((m) => m.id.toLowerCase().includes(needle));
+  }
+
+  models.sort((a, b) => a.id.localeCompare(b.id));
+  return models;
 }
 
 export function listOpenRouterModels(): string {
