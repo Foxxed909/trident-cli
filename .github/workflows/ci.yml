@@ -21,3 +21,5 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: node --test scripts/smoke-test.mjs
+      - name: Build web UI
+        run: cd web && npm ci && npm run build

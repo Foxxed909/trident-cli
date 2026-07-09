@@ -17,6 +17,7 @@ import { ANTHROPIC_PRICING, streamCompletion } from './providers/anthropic.js';
 import { streamOpenRouter, fetchLiveOpenRouterModels } from './providers/openrouter.js';
 import { SLASH_COMMAND_GROUPS } from './ui/commands.js';
 import { saveSessionState, loadSessionState } from './session-store.js';
+import { loadMcpConfig, McpManager, mcpConfigPath } from './mcp/index.js';
 import { runOnboarding } from './ui/onboarding.js';
 import { loadOrCreateContext, generateTridentMd, buildSystemPrompt, generateProjectTree, parseDoNotTouch } from './oracle/index.js';
 import { runAgentLoop, type ProviderName as AgentProviderName } from './agent/loop.js';
@@ -135,6 +136,134 @@ program
       printInfo('Falling back to the built-in list:');
       printAvailableModels();
     }
+  });
+
+program
+  .command('serve')
+  .description('Start the TRIDENT web server (Trident Web UI + WebSocket agent API)')
+  .option('--port <n>', 'Port to listen on', '7777')
+  .option('--host <host>', 'Host to bind (default localhost only)', '127.0.0.1')
+  .action(async (opts: { port?: string; host?: string }) => {
+    const port = resolvePositiveInteger(opts.port, 7777, 'port');
+    const host = opts.host || '127.0.0.1';
+
+    let config: TridentConfig;
+    try {
+      config = getConfig();
+    } catch (err) {
+      printError(err instanceof Error ? err.message : String(err));
+      printInfo('Run "trident heal --reset-config" to recover the config.');
+      process.exit(1);
+      return;
+    }
+
+    const provider = resolveProvider(undefined, config.provider, config.model);
+    if (provider === 'codex') {
+      printError('trident serve requires the anthropic or openrouter provider (codex is CLI-only).');
+      printInfo('Switch with: trident config provider anthropic');
+      process.exit(1);
+      return;
+    }
+
+    const envKey = provider === 'openrouter' ? 'OPENROUTER_API_KEY' : 'ANTHROPIC_API_KEY';
+    if (!process.env[envKey]) {
+      printError(`${envKey} is not set - tasks from the web UI will fail.`);
+      printInfo(`Run: ${formatEnvAssignment(envKey, provider === 'openrouter' ? 'sk-or-...' : 'sk-ant-...')}`);
+    }
+
+    const cwd = process.cwd();
+    printLogo();
+    printInfo('Loading project context...');
+    const ctx = await loadOrCreateContext(cwd);
+
+    let mcp: McpManager | null = null;
+    try {
+      const mcpConfig = await loadMcpConfig(cwd);
+      if (mcpConfig && Object.keys(mcpConfig.mcpServers).length > 0) {
+        printInfo(`Connecting MCP servers: ${Object.keys(mcpConfig.mcpServers).join(', ')}...`);
+        mcp = await McpManager.connect(mcpConfig, cwd);
+      }
+    } catch (err) {
+      printWarn(`MCP config error: ${err instanceof Error ? err.message : String(err)} (continuing without MCP)`);
+    }
+
+    const { startServer } = await import('./server/index.js');
+    const server = await startServer({
+      port,
+      host,
+      cwd,
+      provider: provider as AgentProviderName,
+      model: config.model,
+      mode: config.mode,
+      maxTurns: config.maxTurns,
+      budgetUsd: config.budgetUsd,
+      logSessions: config.logSessions,
+      systemPrompt: buildSystemPrompt(ctx, { systemOverride: config.systemOverride }),
+      protectedPaths: parseDoNotTouch(ctx.tridentMdContent),
+      userName: config.userName,
+      projectName: ctx.name,
+      mcp,
+    });
+
+    printSuccess(`TRIDENT Web is live at ${server.url}`);
+    printInfo(`WebSocket agent API: ws://${host}:${port}/ws`);
+    printInfo(`Workspace: ${cwd} - mode: ${config.mode.toUpperCase()} - model: ${config.model}`);
+    printInfo('Press Ctrl+C to stop.');
+
+    const shutdown = async (): Promise<void> => {
+      server.close();
+      await mcp?.close();
+      process.exit(0);
+    };
+    process.on('SIGINT', () => { void shutdown(); });
+    process.on('SIGTERM', () => { void shutdown(); });
+  });
+
+program
+  .command('mcp')
+  .description('List configured MCP servers and the tools they expose')
+  .action(async () => {
+    const cwd = process.cwd();
+    let config;
+    try {
+      config = await loadMcpConfig(cwd);
+    } catch (err) {
+      printError(`Invalid MCP config: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+      return;
+    }
+
+    if (!config || Object.keys(config.mcpServers).length === 0) {
+      printInfo(`No MCP servers configured. Create ${mcpConfigPath(cwd)} like:`);
+      console.log(chalk.dim(JSON.stringify({
+        mcpServers: {
+          filesystem: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '.'] },
+        },
+      }, null, 2)));
+      return;
+    }
+
+    printInfo(`Connecting ${Object.keys(config.mcpServers).length} MCP server(s)...`);
+    const manager = await McpManager.connect(config, cwd);
+
+    console.log(chalk.hex('#00D4FF').bold('\nTRIDENT MCP Servers\n'));
+    for (const status of manager.getStatuses()) {
+      if (status.connected) {
+        console.log(`  ${chalk.green('OK')} ${chalk.white(status.name.padEnd(20))} ${chalk.dim(`${status.toolCount} tool(s)`)}`);
+      } else {
+        console.log(`  ${chalk.red('NO')} ${chalk.white(status.name.padEnd(20))} ${chalk.red(status.error || 'failed to connect')}`);
+      }
+    }
+
+    const defs = manager.getToolDefinitions();
+    if (defs.length > 0) {
+      console.log(chalk.bold('\n  Tools exposed to the agent\n'));
+      for (const def of defs) {
+        console.log(`    ${chalk.white(def.name.padEnd(40))} ${chalk.dim(def.description.slice(0, 70))}`);
+      }
+    }
+    console.log('');
+    await manager.close();
   });
 
 program
@@ -821,6 +950,31 @@ async function runTrident(
   if (cliOpts?.continue && !resumedState && !jsonOut) {
     printWarn('No previous conversation found for this directory - starting fresh.');
   }
+
+  // Connect configured MCP servers (stdio) so their tools reach the agent.
+  let mcp: McpManager | null = null;
+  try {
+    const mcpConfig = await loadMcpConfig(cwd);
+    if (mcpConfig && Object.keys(mcpConfig.mcpServers).length > 0) {
+      if (!jsonOut) {
+        printInfo(`Connecting MCP servers: ${Object.keys(mcpConfig.mcpServers).join(', ')}...`);
+      }
+      mcp = await McpManager.connect(mcpConfig, cwd);
+      if (!jsonOut) {
+        for (const status of mcp.getStatuses()) {
+          if (status.connected) {
+            printInfo(`MCP ${status.name}: ${status.toolCount} tool(s) available`);
+          } else {
+            printWarn(`MCP ${status.name}: ${status.error || 'failed to connect'}`);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    if (!jsonOut) {
+      printWarn(`MCP config error: ${err instanceof Error ? err.message : String(err)} (continuing without MCP)`);
+    }
+  }
   const getSystemPrompt = (): string => buildSystemPrompt(ctx, {
     profile: activeProfile,
     systemOverride,
@@ -897,7 +1051,9 @@ async function runTrident(
       protectedPaths: getProtectedPaths(),
       history: oneShotHistory,
       quiet: jsonOut,
+      mcp,
     });
+    await mcp?.close();
 
     if (provider !== 'codex') {
       await saveSessionState({
@@ -985,6 +1141,7 @@ async function runTrident(
       undoStack,
       history: agentHistory,
       protectedPaths: getProtectedPaths(),
+      mcp,
     });
 
     if (result) {
@@ -1020,8 +1177,30 @@ async function runTrident(
       case 'q':
         console.log(chalk.hex('#5EEAD4')('\nsigning off. stay powerful.\n'));
         rl.close();
+        await mcp?.close();
         process.exit(0);
         return true;
+
+      case 'mcp': {
+        if (!mcp) {
+          printInfo(`No MCP servers connected. Configure them in ${mcpConfigPath(cwd)} and restart.`);
+          return true;
+        }
+        console.log('');
+        console.log('  ' + chalk.hex('#5EEAD4').bold('MCP servers'));
+        for (const status of mcp.getStatuses()) {
+          if (status.connected) {
+            console.log(`    ${chalk.green('OK')} ${chalk.white(status.name.padEnd(18))} ${chalk.dim(`${status.toolCount} tool(s)`)}`);
+          } else {
+            console.log(`    ${chalk.red('NO')} ${chalk.white(status.name.padEnd(18))} ${chalk.red(status.error || 'failed')}`);
+          }
+        }
+        for (const def of mcp.getToolDefinitions()) {
+          console.log(`      ${chalk.hex('#94A3B8')(def.name)}`);
+        }
+        console.log('');
+        return true;
+      }
 
       case 'status':
       case 'cost':
@@ -1557,6 +1736,7 @@ async function executeTask(
     history?: ChatMessage[];
     protectedPaths?: string[];
     quiet?: boolean;
+    mcp?: McpManager | null;
   }
 ): Promise<Awaited<ReturnType<typeof runAgentLoop>> | null> {
   task = expandFileMentions(task, opts.cwd);
@@ -1653,6 +1833,7 @@ async function executeTask(
       history: opts.history,
       protectedPaths: opts.protectedPaths,
       showDiffs: !opts.quiet,
+      mcp: opts.mcp,
     });
 
     if (!opts.quiet) {

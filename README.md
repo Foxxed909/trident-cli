@@ -71,6 +71,8 @@ trident "add input validation to the config loader"
 | `trident config` | Show current config |
 | `trident config <key> <value>` | Set a config value |
 | `trident doctor` | Check environment and API keys |
+| `trident serve` | Launch Trident Web (browser UI + WebSocket agent API) |
+| `trident mcp` | List configured MCP servers and the tools they expose |
 | `trident review` | Review the latest session action log |
 | `trident review --risk <level>` | Filter the log by risk: read, write, execute, destructive |
 | `trident review --denied` | Show only denied actions |
@@ -302,6 +304,41 @@ trident/
 |-- package.json
 `-- README.md
 ```
+
+## Trident Web
+
+A browser UI for the agent, served locally from your own machine and repo. It streams
+tasks in real time, shows the tool timeline with risk-colored chips, lets you approve or
+deny actions inline, and switches approval mode without leaving the page.
+
+```bash
+npm run build:all      # builds the CLI and the web UI
+trident serve          # → http://127.0.0.1:7777
+```
+
+`trident serve` requires the `anthropic` or `openrouter` provider. It binds to localhost
+only by default; pass `--host 0.0.0.0` to expose it on your network and `--port <n>` to
+change the port. The UI talks to the agent over a WebSocket at `/ws`; MCP servers you've
+configured appear under "Connections". The web source lives in `web/` (Vite + React + TS).
+
+## MCP servers
+
+TRIDENT can connect to [Model Context Protocol](https://modelcontextprotocol.io) servers
+over stdio and expose their tools to the agent as `mcp__<server>__<tool>`. Configure them
+in `.trident/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] },
+    "github": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": { "GITHUB_TOKEN": "..." } }
+  }
+}
+```
+
+Then `trident mcp` lists them and their tools. Every MCP tool is treated as execute-level
+risk, so review mode asks before each call. In interactive mode, `/mcp` shows the live
+connection status.
 
 ## Conversation memory
 

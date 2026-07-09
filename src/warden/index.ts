@@ -21,6 +21,12 @@ export interface ActionLog {
 }
 
 export function classifyRisk(call: ToolCall): RiskLevel {
+  // MCP tools run external code with unknown side effects; treat as execute
+  // so review mode always asks.
+  if (call.name.startsWith('mcp__')) {
+    return 'execute';
+  }
+
   switch (call.name) {
     case 'read_file':
     case 'list_dir':

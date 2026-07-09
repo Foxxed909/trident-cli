@@ -24,7 +24,8 @@ export type ToolName =
   | 'final_answer';
 
 export interface ToolCall {
-  name: ToolName;
+  /** Built-in ToolName, or a namespaced MCP tool (mcp__<server>__<tool>). */
+  name: ToolName | (string & {});
   input: Record<string, unknown>;
 }
 

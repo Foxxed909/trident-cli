@@ -5,6 +5,7 @@ import { streamCompletion, calculateCost } from '../providers/anthropic.js';
 import { streamOpenRouter, calculateOpenRouterCost } from '../providers/openrouter.js';
 import { executeTool, applyEdits, TOOL_DEFINITIONS, resolveWorkspacePath, type ToolCall, type ToolResult } from './tools.js';
 import { classifyRisk, requestApproval, SessionLogger } from '../warden/index.js';
+import { isMcpToolName, type McpManager } from '../mcp/index.js';
 import type { ChatMessage, ContentBlock } from '../providers/anthropic.js';
 import type { ApprovalMode } from '../warden/index.js';
 
@@ -29,6 +30,10 @@ export interface AgentOptions {
   protectedPaths?: string[];
   /** Print diff previews before write/edit approvals (default true; off in headless mode). */
   showDiffs?: boolean;
+  /** Connected MCP servers whose tools are exposed to the agent. */
+  mcp?: McpManager | null;
+  /** Override the approval flow (e.g. web UI approvals). Defaults to warden's terminal prompt. */
+  approvalFn?: (call: ToolCall, mode: ApprovalMode, risk: ReturnType<typeof classifyRisk>) => Promise<boolean>;
   onText?: (text: string) => void;
   onToolStart?: (call: ToolCall) => void | Promise<void>;
   beforeToolExecute?: (call: ToolCall) => void | Promise<void>;
@@ -63,6 +68,9 @@ export async function runAgentLoop(
   let finalAnswerFound = false;
   let budgetExceeded = false;
   const isOpenRouter = opts.provider === 'openrouter';
+  const allToolDefinitions = opts.mcp
+    ? [...TOOL_DEFINITIONS, ...opts.mcp.getToolDefinitions()]
+    : TOOL_DEFINITIONS;
 
   while (turns < opts.maxTurns) {
     turns++;
@@ -84,14 +92,14 @@ export async function runAgentLoop(
               model: opts.model,
               maxTokens: 8192,
               systemPrompt: opts.systemPrompt,
-              tools: TOOL_DEFINITIONS,
+              tools: allToolDefinitions,
               apiKey: process.env.OPENROUTER_API_KEY || '',
             })
           : streamCompletion(messages, {
               model: opts.model,
               maxTokens: 8192,
               systemPrompt: opts.systemPrompt,
-              tools: TOOL_DEFINITIONS,
+              tools: allToolDefinitions,
             });
 
         for await (const chunk of stream) {
@@ -220,7 +228,9 @@ export async function runAgentLoop(
         resetToolLineTracking();
       }
 
-      const approved = await requestApproval(call, opts.mode, risk);
+      const approved = opts.approvalFn
+        ? await opts.approvalFn(call, opts.mode, risk)
+        : await requestApproval(call, opts.mode, risk);
 
       if (!approved) {
         const result: ToolResult = {
@@ -243,7 +253,14 @@ export async function runAgentLoop(
         await opts.beforeToolExecute(call);
       }
 
-      const result = await executeTool(call, opts.cwd, opts.askUserFn, opts.protectedPaths);
+      let result: ToolResult;
+      if (opts.mcp && isMcpToolName(call.name)) {
+        const started = Date.now();
+        const mcpResult = await opts.mcp.callTool(call.name, call.input);
+        result = { ...mcpResult, duration_ms: Date.now() - started };
+      } else {
+        result = await executeTool(call, opts.cwd, opts.askUserFn, opts.protectedPaths);
+      }
       opts.onToolEnd?.(call, result);
 
       await logger.log({ toolName: call.name, input: call.input, result, approved: true, riskLevel: risk });

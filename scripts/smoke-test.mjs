@@ -10,6 +10,7 @@ import { calculateCost } from '../dist/providers/anthropic.js';
 import { OPENROUTER_MODELS } from '../dist/providers/openrouter.js';
 import { classifyRisk, commandMatchesAllowlist } from '../dist/warden/index.js';
 import { expandFileMentions } from '../dist/util.js';
+import { parseMcpToolName, isMcpToolName, loadMcpConfig } from '../dist/mcp/index.js';
 import { TRAINED_PROFILE_NAMES, buildProfileSystemPrompt, resolveProfile } from '../dist/profiles.js';
 
 test('trained profiles are all registered and case-insensitive', () => {
@@ -135,6 +136,38 @@ test('expandFileMentions inlines existing files and skips unknown mentions', () 
 
     const untouched = expandFileMentions('ping @nosuchfile.txt and @also/missing.ts', root);
     assert.equal(untouched, 'ping @nosuchfile.txt and @also/missing.ts');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('MCP tool names parse and classify correctly', () => {
+  assert.deepEqual(parseMcpToolName('mcp__github__create_issue'), { server: 'github', tool: 'create_issue' });
+  assert.deepEqual(parseMcpToolName('mcp__fs__read__file'), { server: 'fs', tool: 'read__file' });
+  assert.equal(parseMcpToolName('read_file'), null);
+  assert.equal(parseMcpToolName('mcp__noseparator'), null);
+  assert.ok(isMcpToolName('mcp__a__b'));
+  assert.ok(!isMcpToolName('write_file'));
+  assert.equal(classifyRisk({ name: 'mcp__github__create_issue', input: {} }), 'execute');
+});
+
+test('MCP config loader validates structure', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'trident-mcp-'));
+  try {
+    assert.equal(await loadMcpConfig(root), null);
+
+    mkdirSync(join(root, '.trident'), { recursive: true });
+    writeFileSync(join(root, '.trident', 'mcp.json'), JSON.stringify({
+      mcpServers: { fs: { command: 'npx', args: ['-y', 'some-server'] } },
+    }));
+    const config = await loadMcpConfig(root);
+    assert.equal(config.mcpServers.fs.command, 'npx');
+
+    writeFileSync(join(root, '.trident', 'mcp.json'), JSON.stringify({ mcpServers: { 'bad name!': { command: 'x' } } }));
+    await assert.rejects(() => loadMcpConfig(root), /Invalid MCP server name/);
+
+    writeFileSync(join(root, '.trident', 'mcp.json'), JSON.stringify({ mcpServers: { ok: {} } }));
+    await assert.rejects(() => loadMcpConfig(root), /needs a "command"/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

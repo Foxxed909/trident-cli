@@ -332,7 +332,11 @@ function formatToolPreview(call: ToolCall): string {
     case 'web_fetch': return call.input.url as string;
     case 'ask_user': return `"${truncate(call.input.question as string, 60)}"`;
     case 'final_answer': return '';
-    default: return '';
+    default:
+      if (call.name.startsWith('mcp__')) {
+        return truncate(JSON.stringify(call.input), 80);
+      }
+      return '';
   }
 }
 
