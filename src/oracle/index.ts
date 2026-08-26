@@ -20,17 +20,36 @@ export interface ProjectContext {
   tree: string;
   tridentMdPath: string;
   tridentMdContent: string | null;
+  /** Emerging multi-agent standard (Codex, Cursor, OpenCode, etc.). */
+  agentsMdContent: string | null;
+  /** Claude Code project instructions. */
+  claudeMdContent: string | null;
 }
 
 const TRIDENT_MD_FILENAME = 'TRIDENT.md';
+const AGENTS_MD_FILENAME = 'AGENTS.md';
+const CLAUDE_MD_FILENAME = 'CLAUDE.md';
+
+async function readOptionalMarkdown(cwd: string, filename: string): Promise<string | null> {
+  const fullPath = join(cwd, filename);
+  if (!existsSync(fullPath)) {
+    return null;
+  }
+  try {
+    return await readFile(fullPath, 'utf-8');
+  } catch {
+    return null;
+  }
+}
 
 export async function loadOrCreateContext(cwd: string): Promise<ProjectContext> {
   const tridentMdPath = join(cwd, TRIDENT_MD_FILENAME);
 
-  let tridentMdContent: string | null = null;
-  if (existsSync(tridentMdPath)) {
-    tridentMdContent = await readFile(tridentMdPath, 'utf-8');
-  }
+  const [tridentMdContent, agentsMdContent, claudeMdContent] = await Promise.all([
+    readOptionalMarkdown(cwd, TRIDENT_MD_FILENAME),
+    readOptionalMarkdown(cwd, AGENTS_MD_FILENAME),
+    readOptionalMarkdown(cwd, CLAUDE_MD_FILENAME),
+  ]);
 
   const name = await detectProjectName(cwd);
   const languages = await detectLanguages(cwd);
@@ -49,6 +68,8 @@ export async function loadOrCreateContext(cwd: string): Promise<ProjectContext> 
     tree,
     tridentMdPath,
     tridentMdContent,
+    agentsMdContent,
+    claudeMdContent,
   };
 }
 
@@ -235,28 +256,28 @@ ${ctx.tree}
 
 ## Context for AI
 *Add any additional context, conventions, or rules for TRIDENT here.*
+
+## Config notes
+TRIDENT also reads AGENTS.md (team standard) and CLAUDE.md (Claude Code)
+if present. Precedence: operator override > TRIDENT.md > AGENTS.md > CLAUDE.md.
 `;
 
   await writeFile(ctx.tridentMdPath, content, 'utf-8');
   return content;
 }
 
-/**
- * Extract the list of protected paths/globs from the "Do Not Touch" section of
- * TRIDENT.md. Bullet items only; the template's italic placeholder is ignored.
- */
-export function parseDoNotTouch(tridentMdContent: string | null): string[] {
-  if (!tridentMdContent) {
+function parseProtectedSection(md: string | null, sectionPattern: RegExp): string[] {
+  if (!md) {
     return [];
   }
 
   const patterns: string[] = [];
   let inSection = false;
 
-  for (const line of tridentMdContent.split(/\r?\n/)) {
+  for (const line of md.split(/\r?\n/)) {
     const heading = line.match(/^#{1,6}\s+(.*)$/);
     if (heading) {
-      inSection = /do\s+not\s+touch/i.test(heading[1]);
+      inSection = sectionPattern.test(heading[1]);
       continue;
     }
     if (!inSection) {
@@ -265,7 +286,7 @@ export function parseDoNotTouch(tridentMdContent: string | null): string[] {
     const item = line.match(/^\s*[-*+]\s+(.+)$/);
     if (item) {
       const cleaned = item[1].trim().replace(/^`+|`+$/g, '').trim();
-      if (cleaned) {
+      if (cleaned && !/^\*.*\*$/.test(cleaned)) {
         patterns.push(cleaned);
       }
     }
@@ -274,13 +295,45 @@ export function parseDoNotTouch(tridentMdContent: string | null): string[] {
   return patterns;
 }
 
+/**
+ * Merge Do Not Touch patterns from TRIDENT.md, AGENTS.md, and CLAUDE.md.
+ * Deduplicates while preserving first-seen order.
+ */
+export function parseDoNotTouch(
+  tridentMdContent: string | null,
+  agentsMdContent?: string | null,
+  claudeMdContent?: string | null
+): string[] {
+  const all = [
+    ...parseProtectedSection(tridentMdContent, /do\s+not\s+touch/i),
+    ...parseProtectedSection(agentsMdContent ?? null, /do\s+not\s+touch|protected|deny|never\s+modify/i),
+    ...parseProtectedSection(claudeMdContent ?? null, /do\s+not\s+touch|protected|deny|never\s+modify/i),
+  ];
+  return [...new Set(all)];
+}
+
 export function buildSystemPrompt(
   ctx: ProjectContext,
   opts: { profile?: TrainedProfile | null; systemOverride?: string } = {}
 ): string {
-  const tridentContext = ctx.tridentMdContent
-    ? `\n\n## PROJECT CONTEXT (TRIDENT.md)\n${ctx.tridentMdContent}`
-    : `\n\n## PROJECT CONTEXT\nProject: ${ctx.name}\nLanguages: ${ctx.languages.join(', ')}\nFrameworks: ${ctx.frameworks.join(', ')}`;
+  const autoContext = `Project: ${ctx.name}\nLanguages: ${ctx.languages.join(', ') || 'unknown'}\nFrameworks: ${ctx.frameworks.join(', ') || 'none'}\nPackage manager: ${ctx.packageManager || 'none'}`;
+
+  const sections: string[] = [];
+
+  if (ctx.claudeMdContent) {
+    sections.push(`## PROJECT CONTEXT (CLAUDE.md)\n${ctx.claudeMdContent}`);
+  }
+  if (ctx.agentsMdContent) {
+    sections.push(`## PROJECT CONTEXT (AGENTS.md)\n${ctx.agentsMdContent}`);
+  }
+  if (ctx.tridentMdContent) {
+    sections.push(`## PROJECT CONTEXT (TRIDENT.md)\n${ctx.tridentMdContent}`);
+  } else if (!ctx.agentsMdContent && !ctx.claudeMdContent) {
+    sections.push(`## PROJECT CONTEXT\n${autoContext}`);
+  }
+
+  const tridentContext = sections.length > 0 ? `\n\n${sections.join('\n\n')}` : '';
+
   const profileContext = opts.profile
     ? `\n\n## TRAINED PROFILE OVERLAY\n${buildProfileSystemPrompt(opts.profile)}`
     : '';
@@ -289,36 +342,7 @@ export function buildSystemPrompt(
     ? `\n\n## OPERATOR SYSTEM OVERRIDE\nThe following instructions override the trained profile output style and any default response formatting when they conflict:\n${override}`
     : '';
 
-  return `You are TRIDENT, an elite autonomous software engineering agent. You operate with three prongs:
-
-- **FORGE** - Build and code with precision and excellence
-- **ORACLE** - Understand codebases deeply before acting
-- **WARDEN** - Protect the codebase; prefer surgical edits over nuclear rewrites
-
-## Your Core Principles
-1. **Think before acting** - Always reason through the task before calling tools
-2. **Minimal blast radius** - Prefer targeted edits over full rewrites
-3. **Verify your work** - After changes, run tests or linters if commands are available
-4. **Ask when uncertain** - Use ask_user for ambiguous critical decisions
-5. **Be transparent** - Briefly explain what you're doing and why
-6. **Complete tasks fully** - Don't stop until the task is verified done
-
-## Agent Loop Rules
-- Use tools systematically to explore, understand, then act
-- After each file write/edit, verify the result with read_file if critical
-- When done, call final_answer with a clear summary of what was accomplished
-- Max iterations: follow the provided turn limit
-
-## Response Style
-- Write in plain text only - no markdown syntax whatsoever
-- No **bold**, no *italics*, no # headers, no bullet points with *, no backtick code blocks in conversational text
-- Use plain sentences and short paragraphs
-- Tool summaries and final_answer must also be plain text
-- Numbered lists are allowed when listing steps, but use "1." style naturally
-${tridentContext}${profileContext}${overrideContext}
-
-## Current Working Directory
-${process.cwd()}`;
+  return `You are TRIDENT, an elite autonomous software engineering agent. You operate with three prongs:\n\n- **FORGE** - Build and code with precision and excellence\n- **ORACLE** - Understand codebases deeply before acting\n- **WARDEN** - Protect the codebase; prefer surgical edits over nuclear rewrites\n\n## Your Core Principles\n1. **Think before acting** - Always reason through the task before calling tools\n2. **Minimal blast radius** - Prefer targeted edits over full rewrites\n3. **Verify your work** - After changes, run tests or linters if commands are available\n4. **Ask when uncertain** - Use ask_user for ambiguous critical decisions\n5. **Be transparent** - Briefly explain what you're doing and why\n6. **Complete tasks fully** - Don't stop until the task is verified done\n\n## Agent Loop Rules\n- Use tools systematically to explore, understand, then act\n- Prefer search_codebase before reading many files blindly\n- After each file write/edit, verify the result with read_file if critical\n- When done, call final_answer with a clear summary of what was accomplished\n- Max iterations: follow the provided turn limit\n\n## Response Style\n- Write in plain text only - no markdown syntax whatsoever\n- No **bold**, no *italics*, no # headers, no bullet points with *, no backtick code blocks in conversational text\n- Use plain sentences and short paragraphs\n- Tool summaries and final_answer must also be plain text\n- Numbered lists are allowed when listing steps, but use "1." style naturally\n${tridentContext}${profileContext}${overrideContext}\n\n## Current Working Directory\n${process.cwd()}`;
 }
 
 async function collectTreeEntries(
