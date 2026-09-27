@@ -1,0 +1,38 @@
+name: Web Lock Refresh
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/web-lock-refresh.yml"
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Refresh compatible Vite React stack
+        run: |
+          cd web
+          npm pkg set 'devDependencies.@vitejs/plugin-react=^6.1.1'
+          npm install --package-lock-only
+          npm ci
+          npm run build
+          npm audit --omit=dev
+
+      - name: Emit web manifests
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          for (const file of ['web/package.json','web/package-lock.json']) {
+            const b64 = Buffer.from(readFileSync(file)).toString('base64');
+            console.log('FILE_BEGIN:' + file);
+            for (let i = 0; i < b64.length; i += 4000) console.log(b64.slice(i, i + 4000));
+            console.log('FILE_END:' + file);
+          }
+          NODE
