@@ -93,16 +93,24 @@ export function getRiskEmoji(level: RiskLevel): string {
   }
 }
 
+const SHELL_CONTROL_RE = /(?:&&|\|\||[;|<>`]|\$\(|\r|\n)/;
+
+function normalizeCommand(cmd: string): string {
+  return cmd.trim().replace(/\s+/g, ' ');
+}
+
+function canPersistCommand(cmd: string): boolean {
+  return cmd.length > 0 && !SHELL_CONTROL_RE.test(cmd);
+}
+
 /**
- * Match a shell command against the persistent allowlist. A rule matches when
- * the command equals it or starts with it followed by a space.
+ * Persistent approvals are exact-command matches only. Compound commands with
+ * shell control operators are never eligible for persistent auto-approval.
  */
 export function commandMatchesAllowlist(cmd: string, allowlist: string[]): boolean {
-  const normalized = cmd.trim();
-  return allowlist.some((rule) => {
-    const r = rule.trim();
-    return r.length > 0 && (normalized === r || normalized.startsWith(`${r} `));
-  });
+  const normalized = normalizeCommand(cmd);
+  if (!canPersistCommand(normalized)) return false;
+  return allowlist.some((rule) => normalizeCommand(rule) === normalized);
 }
 
 function getAllowedCommands(): string[] {
@@ -110,9 +118,9 @@ function getAllowedCommands(): string[] {
   return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string') : [];
 }
 
-/** Derive a persistable allowlist rule: the first two tokens (e.g. "npm test"). */
+/** Persist the exact normalized command, never a broad prefix. */
 function allowlistRuleFor(cmd: string): string {
-  return cmd.trim().split(/\s+/).slice(0, 2).join(' ');
+  return normalizeCommand(cmd);
 }
 
 export async function requestApproval(
@@ -164,16 +172,19 @@ async function promptUser(call: ToolCall, risk: RiskLevel): Promise<boolean> {
 
   if (call.name === 'run_command' && risk !== 'destructive') {
     const rule = allowlistRuleFor((call.input.cmd as string) || '');
+    const choices = [
+      { name: 'Yes, once', value: 'yes' },
+      ...(canPersistCommand(rule)
+        ? [{ name: `Yes, and always allow exactly "${rule}"`, value: 'always' }]
+        : []),
+      { name: 'No', value: 'no' },
+    ];
     const { choice } = await inquirer.prompt([
       {
         type: 'list',
         name: 'choice',
         message: chalk.cyan('Allow this command?'),
-        choices: [
-          { name: 'Yes, once', value: 'yes' },
-          { name: `Yes, and always allow "${rule} ..."`, value: 'always' },
-          { name: 'No', value: 'no' },
-        ],
+        choices,
         default: 'yes',
       },
     ]);
@@ -214,6 +225,31 @@ function formatInputPreview(call: ToolCall): string {
   }
 }
 
+const SENSITIVE_KEY_RE = /(api[-_]?key|token|secret|password|authorization|cookie|credential)/i;
+const SECRET_TEXT_PATTERNS: RegExp[] = [
+  /\bsk-(?:ant-|or-)?[A-Za-z0-9._-]{12,}\b/g,
+  /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g,
+  /\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi,
+];
+
+function redactText(text: string): string {
+  let out = text;
+  for (const pattern of SECRET_TEXT_PATTERNS) out = out.replace(pattern, '[REDACTED]');
+  return out;
+}
+
+function sanitizeLogValue(value: unknown, key = ''): unknown {
+  if (SENSITIVE_KEY_RE.test(key)) return '[REDACTED]';
+  if (typeof value === 'string') return redactText(value).slice(0, 4000);
+  if (Array.isArray(value)) return value.slice(0, 100).map((v) => sanitizeLogValue(v));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, sanitizeLogValue(v, k)])
+    );
+  }
+  return value;
+}
+
 export class SessionLogger {
   private logPath: string;
   private sessionId: string;
@@ -231,7 +267,7 @@ export class SessionLogger {
 
     if (!existsSync(logDir)) {
       try {
-        mkdirSync(logDir, { recursive: true });
+        mkdirSync(logDir, { recursive: true, mode: 0o700 });
       } catch {
         // Logging is non-fatal.
       }
@@ -245,12 +281,18 @@ export class SessionLogger {
 
     const full: ActionLog = {
       ...entry,
+      input: sanitizeLogValue(entry.input) as Record<string, unknown>,
+      result: {
+        ...entry.result,
+        output: redactText(entry.result.output || '').slice(0, 4000),
+        error: entry.result.error ? redactText(entry.result.error).slice(0, 1000) : undefined,
+      },
       timestamp: new Date().toISOString(),
       sessionId: this.sessionId,
     };
 
     try {
-      await appendFile(this.logPath, JSON.stringify(full) + '\n', 'utf-8');
+      await appendFile(this.logPath, JSON.stringify(full) + '\n', { encoding: 'utf-8', mode: 0o600 });
     } catch {
       // Logging is non-fatal.
     }

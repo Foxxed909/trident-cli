@@ -171,7 +171,7 @@ Destructive commands are never auto-approved by the allowlist, and without a ter
 
 ## Session resume
 
-Conversations persist per directory. Pick up where you left off:
+Conversations persist in a separate owner-private state file for each project directory. Pick up where you left off:
 
 ```bash
 trident --continue                      # resume interactively
@@ -237,7 +237,9 @@ Review the most recent log with:
 trident review
 ```
 
-Each entry records the timestamp, tool name, input, result, approval state, and risk level.
+Each entry records the timestamp, tool name, sanitized input/result previews, approval
+state, and risk level. Known secret fields/tokens are redacted, large values are truncated,
+and log files are created with owner-only permissions where the platform supports them.
 
 ## Models
 
@@ -318,8 +320,11 @@ trident serve          # → http://127.0.0.1:7777
 
 `trident serve` requires the `anthropic` or `openrouter` provider. It binds to localhost
 only by default; pass `--host 0.0.0.0` to expose it on your network and `--port <n>` to
-change the port. The UI talks to the agent over a WebSocket at `/ws`; MCP servers you've
-configured appear under "Connections". The web source lives in `web/` (Vite + React + TS).
+change the port. The printed URL contains a one-session authentication token in the URL
+fragment; the UI consumes it and authenticates the WebSocket. Cross-origin WebSocket
+handshakes are rejected, and the browser UI cannot increase permissions beyond the mode
+used when the server started. MCP servers you've configured appear under "Connections".
+The web source lives in `web/` (Vite + React + TS).
 
 ## MCP servers
 
@@ -336,9 +341,16 @@ in `.trident/mcp.json`:
 }
 ```
 
-Then `trident mcp` lists them and their tools. Every MCP tool is treated as execute-level
-risk, so review mode asks before each call. In interactive mode, `/mcp` shows the live
-connection status.
+The first time an MCP config is encountered, TRIDENT shows the exact commands and asks
+you to trust that config. Trust is tied to a SHA-256 fingerprint, so editing
+`.trident/mcp.json` revokes it automatically. Non-interactive/headless runs never execute
+an untrusted MCP config.
+
+MCP child processes inherit only basic runtime variables such as PATH/HOME by default.
+Secrets must be requested explicitly, for example
+`"env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" }`. Every MCP tool is treated as
+execute-level risk, so review mode asks before each call. In interactive mode, `/mcp`
+shows the live connection status.
 
 ## Conversation memory
 

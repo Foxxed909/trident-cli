@@ -9,8 +9,13 @@ import { ConfigSchema } from '../dist/config.js';
 import { calculateCost } from '../dist/providers/anthropic.js';
 import { OPENROUTER_MODELS } from '../dist/providers/openrouter.js';
 import { classifyRisk, commandMatchesAllowlist } from '../dist/warden/index.js';
+import { sessionFilePath } from '../dist/session-store.js';
+import { validateWebSocketHandshake, canSetModeFromWeb } from '../dist/server/index.js';
 import { expandFileMentions } from '../dist/util.js';
-import { parseMcpToolName, isMcpToolName, loadMcpConfig } from '../dist/mcp/index.js';
+import {
+  parseMcpToolName, isMcpToolName, loadMcpConfig,
+  buildMcpEnvironment, mcpConfigFingerprint,
+} from '../dist/mcp/index.js';
 import { TRAINED_PROFILE_NAMES, buildProfileSystemPrompt, resolveProfile } from '../dist/profiles.js';
 
 test('trained profiles are all registered and case-insensitive', () => {
@@ -115,15 +120,15 @@ test('isProtectedPath matches exact paths, directories, and globs', () => {
   assert.ok(!isProtectedPath('environment.md', patterns));
 });
 
-test('command allowlist matches exact and prefixed commands only', () => {
-  const rules = ['npm test', 'git status'];
-  assert.ok(commandMatchesAllowlist('npm test', rules));
-  assert.ok(commandMatchesAllowlist('npm test -- --watch', rules));
+test('command allowlist uses exact normalized commands and rejects shell chaining', () => {
+  const rules = ['npm test', 'git status --short'];
+  assert.ok(commandMatchesAllowlist('npm   test', rules));
   assert.ok(commandMatchesAllowlist('git status --short', rules));
-  assert.ok(!commandMatchesAllowlist('npm testx', rules));
-  assert.ok(!commandMatchesAllowlist('npm install', rules));
+  assert.ok(!commandMatchesAllowlist('npm test -- --watch', rules));
+  assert.ok(!commandMatchesAllowlist('git status', rules));
+  assert.ok(!commandMatchesAllowlist('npm test && echo pwned', rules));
+  assert.ok(!commandMatchesAllowlist('npm test; echo pwned', rules));
   assert.ok(!commandMatchesAllowlist('rm -rf /', rules));
-  assert.ok(!commandMatchesAllowlist('npm', rules));
 });
 
 test('expandFileMentions inlines existing files and skips unknown mentions', () => {
@@ -196,4 +201,57 @@ test('executeTool blocks writes to Do Not Touch paths', async () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+
+test('Do Not Touch merges TRIDENT.md, AGENTS.md, and CLAUDE.md', () => {
+  const trident = '## Do Not Touch\n- .env\n';
+  const agents = '## Protected\n- secrets/**\n';
+  const claude = '## Never Modify\n- prod.pem\n- .env\n';
+  assert.deepEqual(parseDoNotTouch(trident, agents, claude), ['.env', 'secrets/**', 'prod.pem']);
+});
+
+test('MCP environment does not inherit provider secrets unless explicitly requested', () => {
+  const old = process.env.TRIDENT_TEST_SECRET;
+  process.env.TRIDENT_TEST_SECRET = 'sentinel-secret';
+  try {
+    const env = buildMcpEnvironment({ EXPLICIT_SECRET: '${TRIDENT_TEST_SECRET}' });
+    assert.equal(env.TRIDENT_TEST_SECRET, undefined);
+    assert.equal(env.ANTHROPIC_API_KEY, undefined);
+    assert.equal(env.OPENROUTER_API_KEY, undefined);
+    assert.equal(env.EXPLICIT_SECRET, 'sentinel-secret');
+  } finally {
+    if (old === undefined) delete process.env.TRIDENT_TEST_SECRET;
+    else process.env.TRIDENT_TEST_SECRET = old;
+  }
+});
+
+test('MCP trust fingerprint changes with executable config', () => {
+  const a = { mcpServers: { demo: { command: 'node', args: ['a.js'] } } };
+  const b = { mcpServers: { demo: { command: 'node', args: ['b.js'] } } };
+  assert.notEqual(mcpConfigFingerprint(a), mcpConfigFingerprint(b));
+  assert.equal(
+    mcpConfigFingerprint(a),
+    mcpConfigFingerprint({ mcpServers: { demo: { args: ['a.js'], command: 'node' } } })
+  );
+});
+
+test('session persistence is keyed per workspace', () => {
+  assert.notEqual(sessionFilePath('/tmp/project-a'), sessionFilePath('/tmp/project-b'));
+  assert.equal(sessionFilePath('/tmp/project-a'), sessionFilePath('/tmp/project-a'));
+});
+
+test('WebSocket handshake requires same-origin request and correct token', () => {
+  assert.equal(validateWebSocketHandshake('/ws?token=abc', 'http://127.0.0.1:7777', '127.0.0.1:7777', 'abc'), true);
+  assert.equal(validateWebSocketHandshake('/ws?token=wrong', 'http://127.0.0.1:7777', '127.0.0.1:7777', 'abc'), false);
+  assert.equal(validateWebSocketHandshake('/ws?token=abc', 'https://evil.example', '127.0.0.1:7777', 'abc'), false);
+  assert.equal(validateWebSocketHandshake('/ws?token=abc', '', '127.0.0.1:7777', 'abc'), false);
+});
+
+test('web UI cannot increase permissions beyond server startup mode', () => {
+  assert.equal(canSetModeFromWeb('review', 'lockdown'), true);
+  assert.equal(canSetModeFromWeb('review', 'review'), true);
+  assert.equal(canSetModeFromWeb('review', 'yolo'), false);
+  assert.equal(canSetModeFromWeb('lockdown', 'review'), false);
+  assert.equal(canSetModeFromWeb('yolo', 'review'), true);
 });

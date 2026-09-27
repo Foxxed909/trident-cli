@@ -13,7 +13,8 @@
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "serve": "npm run build:all && node dist/index.js serve",
-    "test": "npm run build && node --test scripts/smoke-test.mjs"
+    "test": "npm run build && node --test scripts/smoke-test.mjs",
+    "check:source": "node scripts/check-source.mjs"
   },
   "files": [
     "dist",
@@ -44,5 +45,8 @@
     "@types/ws": "^8.18.1",
     "tsx": "^4.19.0",
     "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }
