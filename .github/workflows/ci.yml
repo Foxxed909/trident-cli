@@ -25,5 +25,8 @@ jobs:
       - run: node --test scripts/smoke-test.mjs
       - name: Build web UI
         run: cd web && npm ci && npm run build
-      - name: Audit production dependencies for critical advisories
-        run: npm audit --omit=dev --audit-level=critical
+      - name: Audit production dependencies
+        run: |
+          npm audit --omit=dev
+          cd web
+          npm audit --omit=dev
