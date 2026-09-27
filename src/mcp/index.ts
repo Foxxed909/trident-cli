@@ -1,6 +1,8 @@
-import { readFile } from 'fs/promises';
-import { existsSync } from 'fs';
-import { join } from 'path';
+import { mkdir, readFile, writeFile } from 'fs/promises';
+import { existsSync, realpathSync } from 'fs';
+import { homedir } from 'os';
+import { join, resolve } from 'path';
+import { createHash } from 'crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
@@ -26,6 +28,74 @@ const CALL_TIMEOUT_MS = 60_000;
 
 export function mcpConfigPath(cwd: string): string {
   return join(cwd, '.trident', 'mcp.json');
+}
+
+const MCP_TRUST_FILE = join(homedir(), '.trident', 'mcp-trust.json');
+const SAFE_PARENT_ENV = [
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 'TERM',
+  'TMP', 'TEMP', 'TMPDIR',
+  'USERNAME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
+  'SystemRoot', 'WINDIR', 'ComSpec', 'PATHEXT',
+];
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return '[' + value.map(stableJson).join(',') + ']';
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    return '{' + Object.keys(obj).sort().map((k) => JSON.stringify(k) + ':' + stableJson(obj[k])).join(',') + '}';
+  }
+  return JSON.stringify(value);
+}
+
+function canonicalWorkspace(cwd: string): string {
+  try { return realpathSync(cwd); } catch { return resolve(cwd); }
+}
+
+export function mcpConfigFingerprint(config: McpConfig): string {
+  return createHash('sha256').update(stableJson(config)).digest('hex');
+}
+
+async function loadMcpTrust(): Promise<Record<string, string>> {
+  try {
+    const parsed = JSON.parse(await readFile(MCP_TRUST_FILE, 'utf-8')) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, string>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+export async function isMcpConfigTrusted(cwd: string, config: McpConfig): Promise<boolean> {
+  const trust = await loadMcpTrust();
+  return trust[canonicalWorkspace(cwd)] === mcpConfigFingerprint(config);
+}
+
+export async function trustMcpConfig(cwd: string, config: McpConfig): Promise<void> {
+  const trust = await loadMcpTrust();
+  trust[canonicalWorkspace(cwd)] = mcpConfigFingerprint(config);
+  await mkdir(join(homedir(), '.trident'), { recursive: true, mode: 0o700 });
+  await writeFile(MCP_TRUST_FILE, JSON.stringify(trust, null, 2), { encoding: 'utf-8', mode: 0o600 });
+}
+
+function expandConfiguredEnv(value: string): string {
+  return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name: string) => {
+    const resolved = process.env[name];
+    if (resolved === undefined) throw new Error(`MCP config requested missing environment variable ${name}`);
+    return resolved;
+  });
+}
+
+export function buildMcpEnvironment(overrides: Record<string, string> = {}): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of SAFE_PARENT_ENV) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  for (const [key, value] of Object.entries(overrides)) {
+    env[key] = expandConfiguredEnv(String(value));
+  }
+  return env;
 }
 
 /** Load .trident/mcp.json. Returns null when absent; throws on malformed JSON. */
@@ -96,7 +166,7 @@ export class McpManager {
         const transport = new StdioClientTransport({
           command: serverConfig.command,
           args: serverConfig.args ?? [],
-          env: { ...process.env as Record<string, string>, ...(serverConfig.env ?? {}) },
+          env: buildMcpEnvironment(serverConfig.env ?? {}),
           cwd,
           stderr: 'ignore',
         });

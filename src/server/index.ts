@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'http';
-import { randomUUID } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import { existsSync, createReadStream, statSync } from 'fs';
 import { join, resolve, extname, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -62,14 +62,47 @@ function getAllowedCommands(): string[] {
   return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string') : [];
 }
 
+export function validateWebSocketHandshake(
+  requestUrl: string,
+  origin: string,
+  host: string,
+  token: string
+): boolean {
+  if (!origin || !host || !token) return false;
+  try {
+    const originUrl = new URL(origin);
+    if (!['http:', 'https:'].includes(originUrl.protocol) || originUrl.host !== host) return false;
+    const request = new URL(requestUrl, `${originUrl.protocol}//${host}`);
+    return request.pathname === '/ws' && request.searchParams.get('token') === token;
+  } catch {
+    return false;
+  }
+}
+
+export function canSetModeFromWeb(initial: ApprovalMode, next: ApprovalMode): boolean {
+  const permissiveness: Record<ApprovalMode, number> = { lockdown: 0, review: 1, yolo: 2 };
+  return permissiveness[next] <= permissiveness[initial];
+}
+
 export async function startServer(opts: ServeOptions): Promise<{ close: () => void; url: string }> {
   const staticDir = webDistDir();
+  const wsToken = randomBytes(32).toString('hex');
 
   const httpServer = createServer((req, res) => {
     handleHttp(req, res, staticDir, opts);
   });
 
-  const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+  const wss = new WebSocketServer({
+    server: httpServer,
+    path: '/ws',
+    maxPayload: 256 * 1024,
+    verifyClient: ({ req }) => validateWebSocketHandshake(
+      req.url || '',
+      String(req.headers.origin || ''),
+      String(req.headers.host || ''),
+      wsToken
+    ),
+  });
 
   wss.on('connection', (socket) => {
     handleConnection(socket, opts);
@@ -80,7 +113,7 @@ export async function startServer(opts: ServeOptions): Promise<{ close: () => vo
     httpServer.listen(opts.port, opts.host, () => resolveListen());
   });
 
-  const url = `http://${opts.host}:${opts.port}`;
+  const url = `http://${opts.host}:${opts.port}/#token=${wsToken}`;
   return {
     url,
     close: () => {
@@ -101,7 +134,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, staticDir: string
 
   if (!existsSync(staticDir)) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(`<!doctype html><meta charset="utf-8"><title>TRIDENT</title><body style="font-family:monospace;background:#0B1220;color:#E2E8F0;padding:3rem"><h1>TRIDENT serve is running</h1><p>WebSocket: <code>ws://${req.headers.host}/ws</code></p><p>The web UI build was not found. Run <code>npm run build</code> inside <code>web/</code> to enable it.</p></body>`);
+    res.end('<!doctype html><meta charset="utf-8"><title>TRIDENT</title><body style="font-family:monospace;background:#0B1220;color:#E2E8F0;padding:3rem"><h1>TRIDENT serve is running</h1><p>Authenticated WebSocket endpoint: <code>/ws</code></p><p>The web UI build was not found. Run <code>npm run build</code> inside <code>web/</code> to enable it.</p></body>');
     return;
   }
 
@@ -190,7 +223,12 @@ function handleConnection(socket: WebSocket, opts: ServeOptions): void {
 
     if (msg.type === 'set_mode') {
       if (msg.mode === 'yolo' || msg.mode === 'review' || msg.mode === 'lockdown') {
-        mode = msg.mode;
+        const next = msg.mode as ApprovalMode;
+        if (!canSetModeFromWeb(opts.mode, next)) {
+          send({ type: 'error', message: `Cannot increase permissions beyond server startup mode (${opts.mode}). Restart trident serve with the desired mode.` });
+          return;
+        }
+        mode = next;
         send({ type: 'mode', mode });
       }
       return;
@@ -252,6 +290,7 @@ function handleConnection(socket: WebSocket, opts: ServeOptions): void {
   });
 
   socket.on('close', () => {
+    for (const resolvePending of pending.values()) resolvePending('');
     pending.clear();
   });
 }

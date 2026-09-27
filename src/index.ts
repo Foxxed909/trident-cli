@@ -17,7 +17,10 @@ import { ANTHROPIC_PRICING, streamCompletion } from './providers/anthropic.js';
 import { streamOpenRouter, fetchLiveOpenRouterModels } from './providers/openrouter.js';
 import { SLASH_COMMAND_GROUPS } from './ui/commands.js';
 import { saveSessionState, loadSessionState } from './session-store.js';
-import { loadMcpConfig, McpManager, mcpConfigPath } from './mcp/index.js';
+import {
+  loadMcpConfig, McpManager, mcpConfigPath,
+  isMcpConfigTrusted, trustMcpConfig,
+} from './mcp/index.js';
 import { runOnboarding } from './ui/onboarding.js';
 import { loadOrCreateContext, generateTridentMd, buildSystemPrompt, generateProjectTree, parseDoNotTouch } from './oracle/index.js';
 import { runAgentLoop, type ProviderName as AgentProviderName } from './agent/loop.js';
@@ -178,11 +181,7 @@ program
 
     let mcp: McpManager | null = null;
     try {
-      const mcpConfig = await loadMcpConfig(cwd);
-      if (mcpConfig && Object.keys(mcpConfig.mcpServers).length > 0) {
-        printInfo(`Connecting MCP servers: ${Object.keys(mcpConfig.mcpServers).join(', ')}...`);
-        mcp = await McpManager.connect(mcpConfig, cwd);
-      }
+      mcp = await connectProjectMcp(cwd);
     } catch (err) {
       printWarn(`MCP config error: ${err instanceof Error ? err.message : String(err)} (continuing without MCP)`);
     }
@@ -243,8 +242,8 @@ program
       return;
     }
 
-    printInfo(`Connecting ${Object.keys(config.mcpServers).length} MCP server(s)...`);
-    const manager = await McpManager.connect(config, cwd);
+    const manager = await connectProjectMcp(cwd);
+    if (!manager) return;
 
     console.log(chalk.hex('#00D4FF').bold('\nTRIDENT MCP Servers\n'));
     for (const status of manager.getStatuses()) {
@@ -828,6 +827,53 @@ program
     }
   });
 
+async function connectProjectMcp(
+  cwd: string,
+  opts: { quiet?: boolean } = {}
+): Promise<McpManager | null> {
+  const config = await loadMcpConfig(cwd);
+  if (!config || Object.keys(config.mcpServers).length === 0) return null;
+
+  const names = Object.keys(config.mcpServers);
+  if (!(await isMcpConfigTrusted(cwd, config))) {
+    if (opts.quiet || !process.stdin.isTTY) {
+      if (!opts.quiet) {
+        printWarn('MCP config is untrusted; refusing repository-defined process execution in non-interactive mode.');
+      }
+      return null;
+    }
+
+    console.log(chalk.yellow('\nRepository MCP configuration requests local process execution:'));
+    for (const [name, spec] of Object.entries(config.mcpServers)) {
+      const command = [spec.command, ...(spec.args ?? [])].join(' ');
+      const envKeys = Object.keys(spec.env ?? {});
+      console.log(`  ${chalk.white(name)}: ${chalk.dim(command)}${envKeys.length ? chalk.dim(`  env: ${envKeys.join(', ')}`) : ''}`);
+    }
+    console.log(chalk.dim('Trust is bound to the exact config fingerprint; editing .trident/mcp.json revokes it.'));
+    const { approved } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'approved',
+      message: chalk.cyan('Trust and start these MCP servers?'),
+      default: false,
+    }]);
+    if (!approved) {
+      printWarn('MCP servers were not started.');
+      return null;
+    }
+    await trustMcpConfig(cwd, config);
+  }
+
+  if (!opts.quiet) printInfo(`Connecting MCP servers: ${names.join(', ')}...`);
+  const manager = await McpManager.connect(config, cwd);
+  if (!opts.quiet) {
+    for (const status of manager.getStatuses()) {
+      if (status.connected) printInfo(`MCP ${status.name}: ${status.toolCount} tool(s) available`);
+      else printWarn(`MCP ${status.name}: ${status.error || 'failed to connect'}`);
+    }
+  }
+  return manager;
+}
+
 function resolveProvider(cliProvider?: string, configProvider?: string, model?: string): TridentProviderName {
   const provider = cliProvider?.toLowerCase();
   if (provider === 'openrouter') return 'openrouter';
@@ -951,25 +997,11 @@ async function runTrident(
     printWarn('No previous conversation found for this directory - starting fresh.');
   }
 
-  // Connect configured MCP servers (stdio) so their tools reach the agent.
+  // Repository MCP config is executable configuration. Only start it after an
+  // explicit trust decision bound to the exact config fingerprint.
   let mcp: McpManager | null = null;
   try {
-    const mcpConfig = await loadMcpConfig(cwd);
-    if (mcpConfig && Object.keys(mcpConfig.mcpServers).length > 0) {
-      if (!jsonOut) {
-        printInfo(`Connecting MCP servers: ${Object.keys(mcpConfig.mcpServers).join(', ')}...`);
-      }
-      mcp = await McpManager.connect(mcpConfig, cwd);
-      if (!jsonOut) {
-        for (const status of mcp.getStatuses()) {
-          if (status.connected) {
-            printInfo(`MCP ${status.name}: ${status.toolCount} tool(s) available`);
-          } else {
-            printWarn(`MCP ${status.name}: ${status.error || 'failed to connect'}`);
-          }
-        }
-      }
-    }
+    mcp = await connectProjectMcp(cwd, { quiet: jsonOut });
   } catch (err) {
     if (!jsonOut) {
       printWarn(`MCP config error: ${err instanceof Error ? err.message : String(err)} (continuing without MCP)`);

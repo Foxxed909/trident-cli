@@ -11,6 +11,18 @@ function uid(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
+function websocketToken(): string {
+  const storageKey = `trident-ws-token:${location.host}`;
+  const hash = new URLSearchParams(location.hash.replace(/^#/, ''));
+  const fromHash = hash.get('token');
+  if (fromHash) {
+    sessionStorage.setItem(storageKey, fromHash);
+    history.replaceState(null, '', location.pathname + location.search);
+    return fromHash;
+  }
+  return sessionStorage.getItem(storageKey) || '';
+}
+
 /**
  * Single-connection client for `trident serve`. Owns the message list, the live
  * approval/ask requests, and the derived connection + status state.
@@ -40,9 +52,15 @@ export function useTrident() {
     let closed = false;
     let retry: ReturnType<typeof setTimeout>;
 
+    const authToken = websocketToken();
+
     const open = (): void => {
+      if (!authToken) {
+        setConn('dead');
+        return;
+      }
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(`${proto}://${location.host}/ws`);
+      const ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(authToken)}`);
       wsRef.current = ws;
 
       ws.onopen = () => setConn('live');
