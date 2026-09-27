@@ -96,7 +96,7 @@ export async function startServer(opts: ServeOptions): Promise<{ close: () => vo
     server: httpServer,
     path: '/ws',
     maxPayload: 256 * 1024,
-    verifyClient: ({ req }) => validateWebSocketHandshake(
+    verifyClient: ({ req }: { req: IncomingMessage }) => validateWebSocketHandshake(
       req.url || '',
       String(req.headers.origin || ''),
       String(req.headers.host || ''),
