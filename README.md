@@ -97,6 +97,8 @@ trident "add input validation to the config loader"
 | `--codex-model <model>` | Optional Codex CLI model override when `--provider codex` |
 | `--codex-timeout <ms>` | Timeout for `codex exec` runs |
 | `-c, --continue` | Resume the previous conversation in this directory |
+| `--session <name>` | Resume or create a named conversation for this workspace |
+| `--execution-profile <profile>` | Hard capability ceiling: `read-only`, `workspace-write`, `dev`, or `full` |
 | `--output json` | One-shot headless mode: machine-readable result on stdout (for scripts/CI) |
 
 ## Interactive commands
@@ -149,7 +151,8 @@ Plain text without a leading `/` is sent to the agent as a task.
 - `/lock` - shortcut for `/mode lockdown`
 - `/models` - list available models
 - `/profiles` - list trained profiles
-- `/sessions` - list recent session log files
+- `/sandbox [profile]` - show or change the execution capability ceiling
+- `/sessions` - list resumable conversations for this workspace
 
 ## Approval modes
 
@@ -159,23 +162,42 @@ Plain text without a leading `/` is sent to the agent as a task.
 | `yolo` | Auto-approve everything |
 | `lockdown` | Confirm every action |
 
-### Persistent command allowlist
+### Execution profiles
 
-When review mode asks about a shell command, choose **"Yes, and always allow"** to save a rule (the command's first two words, e.g. `npm test`). Matching commands are auto-approved in review mode from then on. Rules live in config:
+Approval mode answers **whether** an allowed action should run. Execution profile answers
+**whether that class of action exists at all**. This is a hard ceiling, so even `yolo`
+cannot bypass it.
+
+| Profile | Capabilities |
+|---|---|
+| `read-only` | file reads, directory listing, code search, questions, final answers |
+| `workspace-write` | read-only + write/edit/delete files inside the workspace |
+| `dev` | workspace-write + shell commands and web fetch |
+| `full` | dev + MCP tools |
+
+The default is `full` for backward compatibility. Use
+`trident config executionProfile dev` or `/sandbox dev` for a tighter default.
+
+### Persistent command and MCP allowlists
+
+When review mode asks about a shell command, choose **"Yes, and always allow"** to save that exact normalized command. Matching commands are auto-approved in review mode from then on. Rules live in config:
 
 ```bash
 trident config allowedCommands '["npm test","git status"]'
 ```
 
-Destructive commands are never auto-approved by the allowlist, and without a terminal (piped input, CI) approval prompts are denied rather than assumed - use `--mode yolo` explicitly for unattended runs.
+Destructive commands are never auto-approved by the command allowlist. MCP approvals can also be persisted for the exact namespaced tool (for example `mcp__github__create_issue`); granting one MCP tool never grants the rest of that server. Without a terminal (piped input, CI), approval prompts are denied rather than assumed - use `--mode yolo` explicitly for unattended runs.
 
 ## Session resume
 
-Conversations persist in a separate owner-private state file for each project directory. Pick up where you left off:
+Conversations persist in separate owner-private state files for each project directory. You can keep a default thread or multiple named threads:
 
 ```bash
-trident --continue                      # resume interactively
-trident --continue "now add the tests"  # resume with a one-shot follow-up
+trident --continue                      # resume the default conversation
+trident --continue "now add the tests"  # default one-shot follow-up
+trident --session auth                  # resume/create the "auth" conversation
+trident --session refactor "continue"   # named one-shot follow-up
+trident sessions                        # list resumable conversations here
 ```
 
 ## Headless / CI usage
@@ -202,6 +224,9 @@ Current config keys:
 - `maxTurns`
 - `budgetUsd`
 - `logSessions`
+- `executionProfile`
+- `allowedCommands`
+- `allowedMcpTools`
 - `onboarded`
 - `userName`
 - `profile`
@@ -218,6 +243,7 @@ trident config provider codex
 trident config profile Sydney
 trident config systemOverride "Answer with concise implementation summaries."
 trident config mode review
+trident config executionProfile dev
 trident config maxTurns 30
 trident config budgetUsd 5
 trident config logSessions false
@@ -311,7 +337,8 @@ trident/
 
 A browser UI for the agent, served locally from your own machine and repo. It streams
 tasks in real time, shows the tool timeline with risk-colored chips, lets you approve or
-deny actions inline, and switches approval mode without leaving the page.
+deny actions inline, persists exact command/MCP approvals, exposes the active execution
+profile, and lets you cancel a running task without leaving the page.
 
 ```bash
 npm run build:all      # builds the CLI and the web UI
