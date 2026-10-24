@@ -118,9 +118,34 @@ function getAllowedCommands(): string[] {
   return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string') : [];
 }
 
+function getAllowedMcpTools(): string[] {
+  const raw = getRawConfig().allowedMcpTools;
+  return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string') : [];
+}
+
+export function mcpToolMatchesAllowlist(toolName: string, allowlist: string[]): boolean {
+  return toolName.startsWith('mcp__') && allowlist.includes(toolName);
+}
+
 /** Persist the exact normalized command, never a broad prefix. */
 function allowlistRuleFor(cmd: string): string {
   return normalizeCommand(cmd);
+}
+
+export function persistApprovalForCall(call: ToolCall): string | null {
+  if (call.name === 'run_command') {
+    const rule = allowlistRuleFor((call.input.cmd as string) || '');
+    if (!canPersistCommand(rule)) return null;
+    const allowed = getAllowedCommands();
+    if (!allowed.includes(rule)) setConfig('allowedCommands', [...allowed, rule]);
+    return rule;
+  }
+  if (call.name.startsWith('mcp__')) {
+    const allowed = getAllowedMcpTools();
+    if (!allowed.includes(call.name)) setConfig('allowedMcpTools', [...allowed, call.name]);
+    return call.name;
+  }
+  return null;
 }
 
 export async function requestApproval(
@@ -147,6 +172,9 @@ export async function requestApproval(
     ) {
       return true;
     }
+    if (mcpToolMatchesAllowlist(call.name, getAllowedMcpTools())) {
+      return true;
+    }
     return promptUser(call, risk);
   }
 
@@ -170,11 +198,14 @@ async function promptUser(call: ToolCall, risk: RiskLevel): Promise<boolean> {
   }
   console.log(chalk.dim('-'.repeat(60)));
 
-  if (call.name === 'run_command' && risk !== 'destructive') {
-    const rule = allowlistRuleFor((call.input.cmd as string) || '');
+  if ((call.name === 'run_command' && risk !== 'destructive') || call.name.startsWith('mcp__')) {
+    const rule = call.name === 'run_command'
+      ? allowlistRuleFor((call.input.cmd as string) || '')
+      : call.name;
+    const canPersist = call.name.startsWith('mcp__') || canPersistCommand(rule);
     const choices = [
       { name: 'Yes, once', value: 'yes' },
-      ...(canPersistCommand(rule)
+      ...(canPersist
         ? [{ name: `Yes, and always allow exactly "${rule}"`, value: 'always' }]
         : []),
       { name: 'No', value: 'no' },
@@ -190,10 +221,7 @@ async function promptUser(call: ToolCall, risk: RiskLevel): Promise<boolean> {
     ]);
 
     if (choice === 'always') {
-      const allowed = getAllowedCommands();
-      if (!allowed.includes(rule)) {
-        setConfig('allowedCommands', [...allowed, rule]);
-      }
+      persistApprovalForCall(call);
       console.log(chalk.dim(`  Saved: "${rule}" is now auto-approved in review mode.`));
     }
     return choice !== 'no';

@@ -29,6 +29,30 @@ export interface ToolCall {
   input: Record<string, unknown>;
 }
 
+export type ExecutionProfile = 'read-only' | 'workspace-write' | 'dev' | 'full';
+
+const READ_ONLY_TOOLS = new Set<string>([
+  'read_file', 'list_dir', 'search_codebase', 'ask_user', 'final_answer',
+]);
+const WORKSPACE_WRITE_TOOLS = new Set<string>([
+  ...READ_ONLY_TOOLS, 'write_file', 'edit_file', 'delete_file',
+]);
+const DEV_TOOLS = new Set<string>([
+  ...WORKSPACE_WRITE_TOOLS, 'run_command', 'web_fetch',
+]);
+
+/** Hard capability ceiling, independent of review/yolo/lockdown approvals. */
+export function toolAllowedByExecutionProfile(
+  call: Pick<ToolCall, 'name'>,
+  profile: ExecutionProfile
+): boolean {
+  if (profile === 'full') return true;
+  if (call.name.startsWith('mcp__')) return false;
+  if (profile === 'dev') return DEV_TOOLS.has(call.name);
+  if (profile === 'workspace-write') return WORKSPACE_WRITE_TOOLS.has(call.name);
+  return READ_ONLY_TOOLS.has(call.name);
+}
+
 export interface EditOperation {
   old_str: string;
   new_str: string;
@@ -40,11 +64,20 @@ export async function executeTool(
   call: ToolCall,
   cwd: string,
   askUserFn: (q: string) => Promise<string>,
-  protectedPaths: string[] = []
+  protectedPaths: string[] = [],
+  executionProfile: ExecutionProfile = 'full'
 ): Promise<ToolResult> {
   const start = Date.now();
 
   try {
+    if (!toolAllowedByExecutionProfile(call, executionProfile)) {
+      return {
+        success: false,
+        output: '',
+        error: `Blocked by execution profile "${executionProfile}": ${call.name}`,
+        duration_ms: Date.now() - start,
+      };
+    }
     if (
       (call.name === 'write_file' || call.name === 'edit_file' || call.name === 'delete_file') &&
       protectedPaths.length > 0
