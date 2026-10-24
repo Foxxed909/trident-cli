@@ -16,7 +16,7 @@ import { formatEnvAssignment, expandFileMentions } from './util.js';
 import { ANTHROPIC_PRICING, streamCompletion } from './providers/anthropic.js';
 import { streamOpenRouter, fetchLiveOpenRouterModels } from './providers/openrouter.js';
 import { SLASH_COMMAND_GROUPS } from './ui/commands.js';
-import { saveSessionState, loadSessionState } from './session-store.js';
+import { saveSessionState, loadSessionState, listSessionStates } from './session-store.js';
 import {
   loadMcpConfig, McpManager, mcpConfigPath,
   isMcpConfigTrusted, trustMcpConfig,
@@ -25,7 +25,7 @@ import { runOnboarding } from './ui/onboarding.js';
 import { loadOrCreateContext, generateTridentMd, buildSystemPrompt, generateProjectTree, parseDoNotTouch } from './oracle/index.js';
 import { runAgentLoop, type ProviderName as AgentProviderName } from './agent/loop.js';
 import type { ChatMessage } from './providers/anthropic.js';
-import { resolveWorkspacePath, TOOL_DEFINITIONS } from './agent/tools.js';
+import { resolveWorkspacePath, TOOL_DEFINITIONS, type ExecutionProfile } from './agent/tools.js';
 import { listOpenRouterModels } from './providers/openrouter.js';
 import { codexSandboxForMode, isCodexCliAvailable, runCodexExec } from './providers/codex.js';
 import { formatProfileNames, listTrainedProfiles, resolveProfile, type TrainedProfile } from './profiles.js';
@@ -79,6 +79,8 @@ program
   .option('--codex-model <model>', 'Codex CLI model override (provider=codex only)')
   .option('--codex-timeout <ms>', 'Codex CLI timeout in milliseconds')
   .option('-c, --continue', 'Resume the previous conversation in this directory')
+  .option('--session <name>', 'Resume or create a named conversation in this directory')
+  .option('--execution-profile <profile>', 'Capability ceiling: read-only | workspace-write | dev | full')
   .option('--output <format>', 'One-shot output format: text | json')
   .action(async (task?: string, opts?: {
     model?: string;
@@ -91,6 +93,8 @@ program
     codexModel?: string;
     codexTimeout?: string;
     continue?: boolean;
+    session?: string;
+    executionProfile?: string;
     output?: string;
   }) => {
     await runTrident(task, opts);
@@ -197,6 +201,7 @@ program
       maxTurns: config.maxTurns,
       budgetUsd: config.budgetUsd,
       logSessions: config.logSessions,
+      executionProfile: config.executionProfile,
       systemPrompt: buildSystemPrompt(ctx, { systemOverride: config.systemOverride }),
       protectedPaths: parseDoNotTouch(ctx.tridentMdContent, ctx.agentsMdContent, ctx.claudeMdContent),
       userName: config.userName,
@@ -648,6 +653,7 @@ program
       ['provider', `${config.provider}${providerReady ? ' (ready)' : ' (needs setup)'}`],
       ['model', config.provider === 'codex' ? (config.codexModel || 'codex default') : config.model],
       ['mode', config.mode],
+      ['execution', config.executionProfile],
       ['profile', config.profile || 'none'],
       ['max turns', String(config.maxTurns)],
       ['budget', config.budgetUsd === undefined ? 'none' : `$${config.budgetUsd}`],
@@ -663,21 +669,22 @@ program
 
 program
   .command('sessions')
-  .description('List recent TRIDENT session log files')
-  .option('-n, --limit <n>', 'Number of session logs to show', '10')
+  .description('List resumable conversations for the current workspace')
+  .option('-n, --limit <n>', 'Number of conversations to show', '10')
   .action(async (opts: { limit?: string }) => {
     const limit = resolvePositiveInteger(opts.limit, 10, 'limit');
-    const files = await getRecentSessionLogFiles(limit);
-    if (files.length === 0) {
-      printInfo('No session logs found.');
+    const sessions = (await listSessionStates(process.cwd())).slice(0, limit);
+    if (sessions.length === 0) {
+      printInfo('No resumable conversations found for this workspace.');
       return;
     }
 
-    console.log(chalk.cyan('\nTRIDENT Recent Sessions\n'));
-    for (const file of files) {
-      console.log(`  ${chalk.white(file.replace('.jsonl', ''))}`);
+    console.log(chalk.cyan('\nTRIDENT Resumable Conversations\n'));
+    for (const session of sessions) {
+      const saved = session.savedAt ? new Date(session.savedAt).toLocaleString() : 'unknown';
+      console.log(`  ${chalk.white(session.name.padEnd(18))} ${chalk.dim(`${session.taskCount} task(s) · ${saved}`)}`);
     }
-    console.log('');
+    console.log(chalk.dim('\n  Resume with: trident --session <name>\n'));
   });
 
 program
@@ -948,6 +955,8 @@ async function runTrident(
     codexModel?: string;
     codexTimeout?: string;
     continue?: boolean;
+    session?: string;
+    executionProfile?: string;
     output?: string;
   }
 ): Promise<void> {
@@ -985,6 +994,8 @@ async function runTrident(
   const codexModel = cliOpts?.codexModel ?? config.codexModel;
   const model = provider === 'codex' ? (codexModel || 'codex default') : apiModel;
   const codexTimeoutMs = resolvePositiveInteger(cliOpts?.codexTimeout, config.codexTimeoutMs, 'codex timeout');
+  const executionProfile = resolveExecutionProfile(cliOpts?.executionProfile, config.executionProfile);
+  const sessionName = cliOpts?.session?.trim() || undefined;
   const cwd = process.cwd();
 
   if (!jsonOut) {
@@ -992,9 +1003,11 @@ async function runTrident(
     printInfo('Loading project context...');
   }
   const ctx = await loadOrCreateContext(cwd);
-  const resumedState = cliOpts?.continue ? await loadSessionState(cwd) : null;
-  if (cliOpts?.continue && !resumedState && !jsonOut) {
-    printWarn('No previous conversation found for this directory - starting fresh.');
+  const wantsResume = !!cliOpts?.continue || !!sessionName;
+  const resumedState = wantsResume ? await loadSessionState(cwd, sessionName) : null;
+  if (wantsResume && !resumedState && !jsonOut) {
+    if (sessionName) printInfo(`Starting new named session "${sessionName}".`);
+    else printWarn('No previous conversation found for this directory - starting fresh.');
   }
 
   // Repository MCP config is executable configuration. Only start it after an
@@ -1084,6 +1097,7 @@ async function runTrident(
       history: oneShotHistory,
       quiet: jsonOut,
       mcp,
+      executionProfile,
     });
     await mcp?.close();
 
@@ -1097,7 +1111,8 @@ async function runTrident(
           { task: initialTask, summary: result?.summary || '(failed)', cost: result?.totalCost || 0 },
         ],
         lastTask: initialTask,
-      });
+        name: sessionName,
+      }, sessionName);
     }
 
     if (jsonOut) {
@@ -1122,6 +1137,7 @@ async function runTrident(
     tokens: { input: 0, output: 0 },
     turns: 0,
     budgetUsd: budgetUsd ?? config.budgetUsd,
+    executionProfile,
   };
   const undoStack: UndoEntry[] = [];
   const taskHistory: Array<{ task: string; summary: string; cost: number }> = [];
@@ -1143,7 +1159,8 @@ async function runTrident(
       history: agentHistory,
       taskHistory,
       lastTask,
-    });
+      name: sessionName,
+    }, sessionName);
   };
 
   const runInteractiveTask = async (task: string): Promise<void> => {
@@ -1174,6 +1191,7 @@ async function runTrident(
       history: agentHistory,
       protectedPaths: getProtectedPaths(),
       mcp,
+      executionProfile: session.executionProfile,
     });
 
     if (result) {
@@ -1248,6 +1266,7 @@ async function runTrident(
           profile: session.profile,
           systemOverrideActive: session.systemOverride.trim().length > 0,
         });
+        printInfo(`Execution profile: ${session.executionProfile}${sessionName ? ` · named session: ${sessionName}` : ''}`);
         return true;
 
       case 'history': {
@@ -1634,17 +1653,36 @@ async function runTrident(
         printAvailableModels();
         return true;
 
+      case 'sandbox':
+      case 'execution-profile': {
+        if (!arg) {
+          printInfo(`Execution profile: ${session.executionProfile}`);
+          printInfo('Profiles: read-only | workspace-write | dev | full');
+          return true;
+        }
+        const next = parseExecutionProfile(arg);
+        if (!next) {
+          printError('Usage: /sandbox read-only | workspace-write | dev | full');
+          return true;
+        }
+        session.executionProfile = next;
+        printSuccess(`execution profile -> ${next}`);
+        return true;
+      }
+
       case 'sessions': {
-        const files = await getRecentSessionLogFiles(10);
-        if (files.length === 0) {
-          printInfo('No sessions yet.');
+        const sessions = (await listSessionStates(cwd)).slice(0, 10);
+        if (sessions.length === 0) {
+          printInfo('No resumable conversations for this workspace.');
           return true;
         }
         console.log('');
-        console.log('  ' + chalk.hex('#5EEAD4').bold('Recent sessions'));
-        for (const f of files) {
-          console.log('    ' + chalk.dim(f.replace('.jsonl', '')));
+        console.log('  ' + chalk.hex('#5EEAD4').bold('Resumable conversations'));
+        for (const item of sessions) {
+          const active = sessionName && item.name.toLowerCase() === sessionName.toLowerCase() ? ' ← active' : '';
+          console.log(`    ${chalk.white(item.name.padEnd(18))} ${chalk.dim(`${item.taskCount} task(s)${active}`)}`);
         }
+        console.log(chalk.dim('    Resume another with: trident --session <name>'));
         console.log('');
         return true;
       }
@@ -1769,6 +1807,8 @@ async function executeTask(
     protectedPaths?: string[];
     quiet?: boolean;
     mcp?: McpManager | null;
+    executionProfile?: ExecutionProfile;
+    abortSignal?: AbortSignal;
   }
 ): Promise<Awaited<ReturnType<typeof runAgentLoop>> | null> {
   task = expandFileMentions(task, opts.cwd);
@@ -1866,6 +1906,8 @@ async function executeTask(
       protectedPaths: opts.protectedPaths,
       showDiffs: !opts.quiet,
       mcp: opts.mcp,
+      executionProfile: opts.executionProfile,
+      abortSignal: opts.abortSignal,
     });
 
     if (!opts.quiet) {
@@ -1895,6 +1937,24 @@ process.on('unhandledRejection', (reason) => {
 });
 
 program.parse();
+
+function parseExecutionProfile(value: string): ExecutionProfile | null {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'read-only' || normalized === 'workspace-write' || normalized === 'dev' || normalized === 'full') {
+    return normalized;
+  }
+  return null;
+}
+
+function resolveExecutionProfile(cliValue: string | undefined, configValue: ExecutionProfile): ExecutionProfile {
+  if (!cliValue) return configValue;
+  const parsed = parseExecutionProfile(cliValue);
+  if (!parsed) {
+    printError(`Invalid execution profile: "${cliValue}". Use read-only, workspace-write, dev, or full.`);
+    process.exit(1);
+  }
+  return parsed;
+}
 
 function resolveBudget(cliBudget?: string, configBudget?: number): number | undefined {
   if (cliBudget === undefined || cliBudget === null || cliBudget === '') {
