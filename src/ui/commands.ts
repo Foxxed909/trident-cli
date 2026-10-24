@@ -59,6 +59,7 @@ export const SLASH_COMMAND_GROUPS: SlashCommandGroup[] = [
       { cmd: '/safe', desc: 'shortcut for /mode review' },
       { cmd: '/lock', desc: 'shortcut for /mode lockdown' },
       { cmd: '/models', desc: 'list available models' },
+      { cmd: '/sandbox', args: '[profile]', desc: 'cap tools: read-only | workspace-write | dev | full' },
       { cmd: '/mcp', desc: 'show connected MCP servers and tools' },
       { cmd: '/sessions', desc: 'list past session log files' },
     ],

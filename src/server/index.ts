@@ -5,10 +5,12 @@ import { join, resolve, extname, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { runAgentLoop, type ProviderName } from '../agent/loop.js';
-import type { ToolCall } from '../agent/tools.js';
+import type { ToolCall, ExecutionProfile } from '../agent/tools.js';
 import type { ChatMessage } from '../providers/anthropic.js';
 import type { ApprovalMode, RiskLevel } from '../warden/index.js';
-import { commandMatchesAllowlist } from '../warden/index.js';
+import {
+  commandMatchesAllowlist, mcpToolMatchesAllowlist, persistApprovalForCall,
+} from '../warden/index.js';
 import { getRawConfig } from '../config.js';
 import type { McpManager } from '../mcp/index.js';
 
@@ -22,6 +24,7 @@ export interface ServeOptions {
   maxTurns: number;
   budgetUsd?: number;
   logSessions: boolean;
+  executionProfile: ExecutionProfile;
   systemPrompt: string;
   protectedPaths: string[];
   userName: string;
@@ -30,11 +33,12 @@ export interface ServeOptions {
 }
 
 interface ClientMessage {
-  type: 'task' | 'approve' | 'answer' | 'set_mode';
+  type: 'task' | 'approve' | 'answer' | 'set_mode' | 'cancel';
   id?: string;
   requestId?: string;
   task?: string;
   approved?: boolean;
+  always?: boolean;
   text?: string;
   mode?: string;
 }
@@ -59,6 +63,11 @@ function webDistDir(): string {
 
 function getAllowedCommands(): string[] {
   const raw = getRawConfig().allowedCommands;
+  return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string') : [];
+}
+
+function getAllowedMcpTools(): string[] {
+  const raw = getRawConfig().allowedMcpTools;
   return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string') : [];
 }
 
@@ -161,6 +170,7 @@ function statusPayload(opts: ServeOptions): Record<string, unknown> {
     mode: opts.mode,
     userName: opts.userName,
     protectedPaths: opts.protectedPaths,
+    executionProfile: opts.executionProfile,
     mcpServers: opts.mcp ? opts.mcp.getStatuses() : [],
   };
 }
@@ -168,9 +178,11 @@ function statusPayload(opts: ServeOptions): Record<string, unknown> {
 function handleConnection(socket: WebSocket, opts: ServeOptions): void {
   const history: ChatMessage[] = [];
   const pending = new Map<string, (value: string) => void>();
+  const pendingApprovalCalls = new Map<string, ToolCall>();
   let mode: ApprovalMode = opts.mode;
   let sessionCost = 0;
   let busy = false;
+  let activeController: AbortController | null = null;
 
   const send = (msg: Record<string, unknown>): void => {
     if (socket.readyState === socket.OPEN) {
@@ -193,8 +205,12 @@ function handleConnection(socket: WebSocket, opts: ServeOptions): void {
           commandMatchesAllowlist((call.input.cmd as string) || '', getAllowedCommands())) {
         return true;
       }
+      if (mcpToolMatchesAllowlist(call.name, getAllowedMcpTools())) {
+        return true;
+      }
     }
     const requestId = randomUUID();
+    pendingApprovalCalls.set(requestId, call);
     send({ type: 'approval_request', requestId, call: { name: call.name, input: call.input }, risk });
     const answer = await waitForClient(requestId);
     return answer === 'true';
@@ -210,14 +226,28 @@ function handleConnection(socket: WebSocket, opts: ServeOptions): void {
     }
 
     if (msg.type === 'approve' && msg.requestId) {
+      const call = pendingApprovalCalls.get(msg.requestId);
+      if (msg.approved && msg.always && call) persistApprovalForCall(call);
       pending.get(msg.requestId)?.(String(!!msg.approved));
       pending.delete(msg.requestId);
+      pendingApprovalCalls.delete(msg.requestId);
       return;
     }
 
     if (msg.type === 'answer' && msg.requestId) {
       pending.get(msg.requestId)?.(msg.text || '');
       pending.delete(msg.requestId);
+      return;
+    }
+
+    if (msg.type === 'cancel') {
+      if (busy && activeController) {
+        activeController.abort();
+        for (const resolvePending of pending.values()) resolvePending('');
+        pending.clear();
+        pendingApprovalCalls.clear();
+        send({ type: 'task_cancel_requested' });
+      }
       return;
     }
 
@@ -244,6 +274,8 @@ function handleConnection(socket: WebSocket, opts: ServeOptions): void {
       }
 
       busy = true;
+      const controller = new AbortController();
+      activeController = controller;
       send({ type: 'task_start', id });
       try {
         const result = await runAgentLoop(task, {
@@ -260,6 +292,8 @@ function handleConnection(socket: WebSocket, opts: ServeOptions): void {
           protectedPaths: opts.protectedPaths,
           showDiffs: false,
           mcp: opts.mcp,
+          executionProfile: opts.executionProfile,
+          abortSignal: controller.signal,
           approvalFn,
           onText: (text) => send({ type: 'text', id, text }),
           onToolStart: (call) => send({ type: 'tool_start', id, call: { name: call.name, input: call.input } }),
@@ -284,13 +318,16 @@ function handleConnection(socket: WebSocket, opts: ServeOptions): void {
       } catch (err) {
         send({ type: 'task_error', id, message: err instanceof Error ? err.message : String(err) });
       } finally {
+        if (activeController === controller) activeController = null;
         busy = false;
       }
     }
   });
 
   socket.on('close', () => {
+    activeController?.abort();
     for (const resolvePending of pending.values()) resolvePending('');
     pending.clear();
+    pendingApprovalCalls.clear();
   });
 }

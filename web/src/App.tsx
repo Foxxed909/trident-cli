@@ -93,6 +93,7 @@ export function App() {
           <span className="topbar-title">{view === 'connections' ? 'Connections' : (t.status?.project ?? 'TRIDENT')}</span>
           <div className="topbar-meta">
             <span className="chip"><span className="swatch" style={{ background: 'var(--teal)' }} />{t.status?.model ?? '…'}</span>
+            {t.status?.executionProfile && <span className="chip">{t.status.executionProfile}</span>}
             {t.sessionCost > 0 && <span className="chip" style={{ color: 'var(--amber)' }}>${t.sessionCost.toFixed(4)}</span>}
             <ModeSwitch mode={t.mode} onChange={t.changeMode} />
             <span className={`conn-status ${t.conn === 'live' ? 'live' : 'dead'}`} title={t.conn}>
@@ -116,7 +117,7 @@ export function App() {
                 </div>
               )}
             </div>
-            <Composer disabled={t.conn !== 'live'} busy={t.busy} onSend={t.runTask} />
+            <Composer disabled={t.conn !== 'live'} busy={t.busy} onSend={t.runTask} onCancel={t.cancelTask} />
           </>
         )}
       </main>

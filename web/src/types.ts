@@ -35,6 +35,7 @@ export interface TaskResultView {
   turns: number;
   totalCost: number;
   totalTokens: { input: number; output: number };
+  cancelled?: boolean;
 }
 
 export interface Message {
@@ -61,5 +62,6 @@ export interface ServerStatus {
   mode: Mode;
   userName: string;
   protectedPaths: string[];
+  executionProfile: 'read-only' | 'workspace-write' | 'dev' | 'full';
   mcpServers: McpServerStatus[];
 }

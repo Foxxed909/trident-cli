@@ -3,7 +3,11 @@ import { createDiffView } from '../ui/diff.js';
 import { resetToolLineTracking } from '../ui/renderer.js';
 import { streamCompletion, calculateCost } from '../providers/anthropic.js';
 import { streamOpenRouter, calculateOpenRouterCost } from '../providers/openrouter.js';
-import { executeTool, applyEdits, TOOL_DEFINITIONS, resolveWorkspacePath, type ToolCall, type ToolResult } from './tools.js';
+import {
+  executeTool, applyEdits, TOOL_DEFINITIONS, resolveWorkspacePath,
+  toolAllowedByExecutionProfile,
+  type ToolCall, type ToolResult, type ExecutionProfile,
+} from './tools.js';
 import { classifyRisk, requestApproval, SessionLogger } from '../warden/index.js';
 import { isMcpToolName, type McpManager } from '../mcp/index.js';
 import type { ChatMessage, ContentBlock } from '../providers/anthropic.js';
@@ -32,6 +36,10 @@ export interface AgentOptions {
   showDiffs?: boolean;
   /** Connected MCP servers whose tools are exposed to the agent. */
   mcp?: McpManager | null;
+  /** Hard tool capability ceiling, independent of approval mode. */
+  executionProfile?: ExecutionProfile;
+  /** Operator cancellation signal (used by Trident Web and future clients). */
+  abortSignal?: AbortSignal;
   /** Override the approval flow (e.g. web UI approvals). Defaults to warden's terminal prompt. */
   approvalFn?: (call: ToolCall, mode: ApprovalMode, risk: ReturnType<typeof classifyRisk>) => Promise<boolean>;
   onText?: (text: string) => void;
@@ -48,6 +56,7 @@ export interface AgentResult {
   turns: number;
   totalCost: number;
   totalTokens: { input: number; output: number };
+  cancelled?: boolean;
 }
 
 export async function runAgentLoop(
@@ -67,12 +76,23 @@ export async function runAgentLoop(
   let finalSummary = 'Task completed.';
   let finalAnswerFound = false;
   let budgetExceeded = false;
+  let cancelled = false;
   const isOpenRouter = opts.provider === 'openrouter';
-  const allToolDefinitions = opts.mcp
-    ? [...TOOL_DEFINITIONS, ...opts.mcp.getToolDefinitions()]
-    : TOOL_DEFINITIONS;
+  const executionProfile = opts.executionProfile ?? 'full';
+  const builtInToolDefinitions = TOOL_DEFINITIONS.filter((tool) =>
+    toolAllowedByExecutionProfile({ name: tool.name as ToolCall['name'] }, executionProfile)
+  );
+  const mcpDefinitions = opts.mcp && executionProfile === 'full'
+    ? opts.mcp.getToolDefinitions()
+    : [];
+  const allToolDefinitions = [...builtInToolDefinitions, ...mcpDefinitions];
 
   while (turns < opts.maxTurns) {
+    if (opts.abortSignal?.aborted) {
+      cancelled = true;
+      finalSummary = 'Cancelled by operator.';
+      break;
+    }
     turns++;
 
     let assistantText = '';
@@ -103,6 +123,10 @@ export async function runAgentLoop(
             });
 
         for await (const chunk of stream) {
+          if (opts.abortSignal?.aborted) {
+            cancelled = true;
+            break;
+          }
           if (chunk.type === 'text' && chunk.text) {
             assistantText += chunk.text;
             opts.onText?.(chunk.text);
@@ -112,6 +136,12 @@ export async function runAgentLoop(
             turnInputTokens = chunk.usage.inputTokens;
             turnOutputTokens = chunk.usage.outputTokens;
           }
+        }
+
+        if (cancelled || opts.abortSignal?.aborted) {
+          cancelled = true;
+          finalSummary = 'Cancelled by operator.';
+          break;
         }
 
         totalInputTokens += turnInputTokens;
@@ -131,6 +161,10 @@ export async function runAgentLoop(
         console.log(chalk.yellow(`\n  retrying after API error (${error.message.slice(0, 60)}) ${streamAttempt}/2...`));
         await new Promise((r) => setTimeout(r, 1500 * streamAttempt));
       }
+    }
+
+    if (cancelled) {
+      break;
     }
 
     const assistantContent: ChatMessage['content'] = [];
@@ -191,6 +225,33 @@ export async function runAgentLoop(
     for (const tc of executableCalls) {
       const call: ToolCall = { name: tc.name, input: tc.input };
       const risk = classifyRisk(call);
+
+      if (opts.abortSignal?.aborted) {
+        cancelled = true;
+        const result: ToolResult = {
+          success: false,
+          output: '',
+          error: 'Cancelled by operator before execution.',
+          duration_ms: 0,
+        };
+        opts.onToolEnd?.(call, result);
+        toolResults.push({ type: 'tool_result', tool_use_id: tc.id, content: JSON.stringify(result) });
+        await logger.log({ toolName: call.name, input: call.input, result, approved: false, riskLevel: risk });
+        continue;
+      }
+
+      if (!toolAllowedByExecutionProfile(call, executionProfile)) {
+        const result: ToolResult = {
+          success: false,
+          output: '',
+          error: `Blocked by execution profile "${executionProfile}": ${call.name}`,
+          duration_ms: 0,
+        };
+        opts.onToolEnd?.(call, result);
+        toolResults.push({ type: 'tool_result', tool_use_id: tc.id, content: JSON.stringify(result) });
+        await logger.log({ toolName: call.name, input: call.input, result, approved: false, riskLevel: risk });
+        continue;
+      }
 
       // Loop detection: an identical call repeated many times means the agent
       // is stuck; short-circuit instead of burning budget on it.
@@ -259,7 +320,7 @@ export async function runAgentLoop(
         const mcpResult = await opts.mcp.callTool(call.name, call.input);
         result = { ...mcpResult, duration_ms: Date.now() - started };
       } else {
-        result = await executeTool(call, opts.cwd, opts.askUserFn, opts.protectedPaths);
+        result = await executeTool(call, opts.cwd, opts.askUserFn, opts.protectedPaths, executionProfile);
       }
       opts.onToolEnd?.(call, result);
 
@@ -274,6 +335,12 @@ export async function runAgentLoop(
         tool_use_id: tc.id,
         content: resultContent || '(no output)',
       });
+    }
+
+    if (cancelled) {
+      messages.push({ role: 'user', content: toolResults as unknown as ChatMessage['content'] });
+      finalSummary = 'Cancelled by operator.';
+      break;
     }
 
     if (finalAnswerCall) {
@@ -305,7 +372,7 @@ export async function runAgentLoop(
     toolName: '__task_summary',
     input: { task: initialTask.slice(0, 200) },
     result: {
-      success: finalAnswerFound && !budgetExceeded,
+      success: finalAnswerFound && !budgetExceeded && !cancelled,
       output: JSON.stringify({
         cost: totalCost,
         turns,
@@ -320,11 +387,12 @@ export async function runAgentLoop(
   });
 
   return {
-    success: finalAnswerFound,
+    success: finalAnswerFound && !budgetExceeded && !cancelled,
     summary: finalSummary,
     turns,
     totalCost,
     totalTokens: { input: totalInputTokens, output: totalOutputTokens },
+    cancelled,
   };
 }
 

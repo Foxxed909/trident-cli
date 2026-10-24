@@ -3,12 +3,16 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolveWorkspacePath, applyEdits, isProtectedPath, executeTool } from '../dist/agent/tools.js';
+import {
+  resolveWorkspacePath, applyEdits, isProtectedPath, executeTool, toolAllowedByExecutionProfile,
+} from '../dist/agent/tools.js';
 import { parseDoNotTouch } from '../dist/oracle/index.js';
 import { ConfigSchema } from '../dist/config.js';
 import { calculateCost } from '../dist/providers/anthropic.js';
 import { OPENROUTER_MODELS } from '../dist/providers/openrouter.js';
-import { classifyRisk, commandMatchesAllowlist } from '../dist/warden/index.js';
+import {
+  classifyRisk, commandMatchesAllowlist, mcpToolMatchesAllowlist,
+} from '../dist/warden/index.js';
 import { sessionFilePath } from '../dist/session-store.js';
 import { validateWebSocketHandshake, canSetModeFromWeb } from '../dist/server/index.js';
 import { expandFileMentions } from '../dist/util.js';
@@ -254,4 +258,46 @@ test('web UI cannot increase permissions beyond server startup mode', () => {
   assert.equal(canSetModeFromWeb('review', 'yolo'), false);
   assert.equal(canSetModeFromWeb('lockdown', 'review'), false);
   assert.equal(canSetModeFromWeb('yolo', 'review'), true);
+});
+
+test('execution profiles enforce hard capability ceilings', () => {
+  const read = { name: 'read_file' };
+  const write = { name: 'write_file' };
+  const command = { name: 'run_command' };
+  const mcp = { name: 'mcp__github__create_issue' };
+  assert.equal(toolAllowedByExecutionProfile(read, 'read-only'), true);
+  assert.equal(toolAllowedByExecutionProfile(write, 'read-only'), false);
+  assert.equal(toolAllowedByExecutionProfile(write, 'workspace-write'), true);
+  assert.equal(toolAllowedByExecutionProfile(command, 'workspace-write'), false);
+  assert.equal(toolAllowedByExecutionProfile(command, 'dev'), true);
+  assert.equal(toolAllowedByExecutionProfile(mcp, 'dev'), false);
+  assert.equal(toolAllowedByExecutionProfile(mcp, 'full'), true);
+});
+
+test('executeTool refuses capabilities blocked by execution profile', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'trident-profile-'));
+  try {
+    const result = await executeTool(
+      { name: 'write_file', input: { path: 'blocked.txt', content: 'nope' } },
+      root, async () => '', [], 'read-only'
+    );
+    assert.equal(result.success, false);
+    assert.match(result.error, /execution profile/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('MCP persistent approvals are exact-tool matches', () => {
+  const rules = ['mcp__github__create_issue'];
+  assert.equal(mcpToolMatchesAllowlist('mcp__github__create_issue', rules), true);
+  assert.equal(mcpToolMatchesAllowlist('mcp__github__delete_repo', rules), false);
+  assert.equal(mcpToolMatchesAllowlist('run_command', rules), false);
+});
+
+test('named sessions use independent persistence files', () => {
+  const cwd = '/tmp/trident-named-session-project';
+  assert.notEqual(sessionFilePath(cwd, 'alpha'), sessionFilePath(cwd, 'beta'));
+  assert.notEqual(sessionFilePath(cwd), sessionFilePath(cwd, 'alpha'));
+  assert.equal(sessionFilePath(cwd, 'alpha'), sessionFilePath(cwd, 'ALPHA'));
 });

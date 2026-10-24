@@ -135,6 +135,9 @@ export function useTrident() {
         case 'ask_user':
           setAsk({ requestId: msg.requestId as string, question: msg.question as string });
           break;
+        case 'task_cancel_requested':
+          patchAgent((m) => ({ ...m, text: m.text + '\n\nCancelling…' }));
+          break;
         case 'task_result': {
           const result = msg.result as TaskResultView;
           patchAgent((m) => ({ ...m, streaming: false, result }));
@@ -175,8 +178,7 @@ export function useTrident() {
 
   const respondApproval = useCallback((approved: boolean, always?: boolean) => {
     if (!approval) return;
-    if (always) send({ type: 'answer', requestId: `always:${approval.requestId}` });
-    send({ type: 'approve', requestId: approval.requestId, approved });
+    send({ type: 'approve', requestId: approval.requestId, approved, always: !!always });
     setApproval(null);
   }, [approval, send]);
 
@@ -191,6 +193,11 @@ export function useTrident() {
     send({ type: 'set_mode', mode: next });
   }, [send]);
 
+  const cancelTask = useCallback(() => {
+    if (!busy) return;
+    send({ type: 'cancel' });
+  }, [busy, send]);
+
   const newChat = useCallback(() => {
     if (busy) return;
     setMessages([]);
@@ -201,7 +208,7 @@ export function useTrident() {
 
   return {
     conn, status, mode, messages, approval, ask, busy, sessionCost,
-    runTask, respondApproval, respondAsk, changeMode, newChat,
+    runTask, cancelTask, respondApproval, respondAsk, changeMode, newChat,
   };
 }
 

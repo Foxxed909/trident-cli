@@ -58,7 +58,7 @@ export function MessageView({ msg }: { msg: Message }) {
         )}
         {msg.result && (
           <div className="task-foot">
-            <span className="stat">✓ done</span>
+            <span className="stat">{msg.result.cancelled ? '■ cancelled' : msg.result.success ? '✓ done' : '✕ stopped'}</span>
             <span className="stat">{msg.result.turns} turns</span>
             <span className="stat">{(msg.result.totalTokens.input + msg.result.totalTokens.output).toLocaleString()} tok</span>
             <span className="stat cost">${msg.result.totalCost.toFixed(4)}</span>
@@ -77,6 +77,7 @@ export function ApprovalCard({ req, onRespond }: {
 }) {
   const detail = argPreview(req.call.name, req.call.input) || JSON.stringify(req.call.input, null, 2);
   const isCmd = req.call.name === 'run_command';
+  const canPersist = (isCmd && req.risk !== 'destructive') || req.call.name.startsWith('mcp__');
   return (
     <div className={`approval ${req.risk}`}>
       <div className="approval-head">
@@ -86,7 +87,7 @@ export function ApprovalCard({ req, onRespond }: {
       <div className="approval-detail">{detail}</div>
       <div className="approval-actions">
         <button className="btn btn-primary" onClick={() => onRespond(true)}>Approve</button>
-        {isCmd && req.risk !== 'destructive' && (
+        {canPersist && (
           <button className="btn btn-ghost" onClick={() => onRespond(true, true)}>Approve &amp; always allow</button>
         )}
         <button className="btn btn-danger" onClick={() => onRespond(false)}>Deny</button>
@@ -133,8 +134,8 @@ export function ModeSwitch({ mode, onChange }: { mode: Mode; onChange: (m: Mode)
   );
 }
 
-export function Composer({ disabled, busy, onSend }: {
-  disabled: boolean; busy: boolean; onSend: (task: string) => void;
+export function Composer({ disabled, busy, onSend, onCancel }: {
+  disabled: boolean; busy: boolean; onSend: (task: string) => void; onCancel: () => void;
 }) {
   const [val, setVal] = useState('');
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -165,10 +166,16 @@ export function Composer({ disabled, busy, onSend }: {
             placeholder={busy ? 'Trident is working…' : 'Describe a task, or paste an error…'}
             onChange={(e) => setVal(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }}
-            disabled={disabled}
+            disabled={disabled || busy}
           />
-          <button className="send" onClick={submit} disabled={disabled || busy || !val.trim()} aria-label="Send">
-            <Icon name="send" size={16} />
+          <button
+            className="send"
+            onClick={busy ? onCancel : submit}
+            disabled={disabled || (!busy && !val.trim())}
+            aria-label={busy ? 'Cancel task' : 'Send'}
+            title={busy ? 'Cancel task' : 'Send'}
+          >
+            {busy ? <span aria-hidden="true">■</span> : <Icon name="send" size={16} />}
           </button>
         </div>
         <div className="composer-hint">
